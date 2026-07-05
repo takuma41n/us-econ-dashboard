@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>米国経済指標ダッシュボード</title>
+<style>
+  :root {
+    --page:           #f9f9f7;
+    --surface:        #fcfcfb;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --grid:           #e1e0d9;
+    --border:         rgba(11, 11, 11, 0.10);
+    --good:           #006300;
+    --bad:            #d03b3b;
+    --spark-line:     #86b6ef;   /* blue 250: 非強調ヒュー */
+    --spark-accent:   #2a78d6;   /* blue 450: 最新点のアクセント */
+    --spark-wash:     rgba(42, 120, 214, 0.10);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page:           #0d0d0d;
+      --surface:        #1a1a19;
+      --text-primary:   #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted:     #898781;
+      --grid:           #2c2c2a;
+      --border:         rgba(255, 255, 255, 0.10);
+      --good:           #0ca30c;
+      --bad:            #d03b3b;
+      --spark-line:     #1c5cab; /* blue 550 */
+      --spark-accent:   #3987e5; /* blue 400 */
+      --spark-wash:     rgba(57, 135, 229, 0.10);
+    }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--page);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", "Hiragino Sans", "Noto Sans JP", sans-serif;
+    padding: 24px clamp(16px, 4vw, 48px) 64px;
+  }
+
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 12px 16px;
+    margin-bottom: 8px;
+  }
+  h1 { font-size: 20px; font-weight: 650; }
+  .updated { font-size: 12px; color: var(--text-muted); }
+  .refresh-btn {
+    margin-left: auto;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+  .refresh-btn:hover { border-color: var(--text-muted); }
+  .refresh-btn:disabled { opacity: 0.5; cursor: wait; }
+
+  .banner {
+    display: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin: 16px 0;
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--text-secondary);
+  }
+  .banner.show { display: block; }
+  .banner strong { color: var(--text-primary); }
+  .banner a { color: var(--spark-accent); }
+  .banner code {
+    background: var(--page);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 12px;
+  }
+
+  section { margin-top: 28px; }
+  h2 {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    letter-spacing: 0.04em;
+    margin-bottom: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--grid);
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
+    gap: 14px;
+  }
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px 12px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: border-color 0.15s;
+  }
+  .card:hover { border-color: var(--text-muted); }
+
+  .card-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .card-label { font-size: 13px; font-weight: 600; color: var(--text-secondary); }
+  .card-sid {
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+
+  .card-value-row { display: flex; align-items: baseline; gap: 4px; }
+  .card-value { font-size: 34px; font-weight: 600; line-height: 1.1; }
+  .card-unit { font-size: 14px; color: var(--text-secondary); }
+
+  .card-meta { font-size: 11px; color: var(--text-muted); }
+  .card-meta .chip {
+    display: inline-block;
+    white-space: nowrap;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 0 5px;
+    margin-left: 6px;
+  }
+
+  .card-delta { font-size: 12.5px; color: var(--text-secondary); }
+  .card-delta .dir { font-weight: 650; }
+  .card-delta .dir.good { color: var(--good); }
+  .card-delta .dir.bad  { color: var(--bad); }
+
+  .spark { margin-top: 6px; width: 100%; height: 52px; display: block; }
+
+  .card.loading .card-value { color: var(--text-muted); }
+  .card .err { font-size: 12px; color: var(--bad); }
+
+  #tooltip {
+    position: fixed;
+    display: none;
+    pointer-events: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+    padding: 6px 10px;
+    font-size: 12px;
+    z-index: 10;
+    white-space: nowrap;
+  }
+  #tooltip .t-date { color: var(--text-muted); font-size: 11px; }
+  #tooltip .t-val { font-weight: 600; }
+
+  footer {
+    margin-top: 40px;
+    font-size: 11px;
+    color: var(--text-muted);
+    line-height: 1.7;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>米国経済指標ダッシュボード</h1>
+  <span class="updated" id="updated"></span>
+  <button class="refresh-btn" id="refresh">最新に更新</button>
+</header>
+
+<div class="banner" id="banner"></div>
+
+<div id="sections"></div>
+
+<div id="tooltip"></div>
+
+<footer>
+  データ出典: FRED, Federal Reserve Bank of St. Louis。カードをクリックするとFREDの系列ページが開きます。<br>
+  色の意味: <span style="color:var(--good)">緑</span> = インフレ沈静化・雇用改善の方向 / <span style="color:var(--bad)">赤</span> = その逆。賃金指標はインフレ圧力の観点で色付けしています。
+</footer>
+
+<script>
+"use strict";
+
+/* ── 指標定義 ─────────────────────────────────────────────
+ * goodWhenDown: 前回比が下がったとき「良い（緑）」とみなすか。
+ * 賃金系はインフレ圧力の観点で down=good。PAYEMSのみ up=good。
+ */
+const SERIES = [
+  { id: "PCEPILFE", name: "コアPCE", cat: "インフレ動向",
+    units: "pc1", freq: "m", fmt: "pct", goodWhenDown: true,
+    note: "前年比・食品/エネルギー除く" },
+  { id: "CPILFESL", name: "コアCPI", cat: "インフレ動向",
+    units: "pc1", freq: "m", fmt: "pct", goodWhenDown: true,
+    note: "前年比・食品/エネルギー除く" },
+  { id: "UNRATE", name: "失業率", cat: "雇用状況",
+    units: "lin", freq: "m", fmt: "pct", goodWhenDown: true,
+    note: "" },
+  { id: "PAYEMS", name: "非農業部門雇用者数", cat: "雇用状況",
+    units: "chg", freq: "m", fmt: "man10", goodWhenDown: false,
+    note: "前月差" },
+  { id: "ICSA", name: "新規失業保険申請", cat: "雇用状況",
+    units: "lin", freq: "w", fmt: "man", goodWhenDown: true,
+    note: "週次" },
+  { id: "ECIWAG", name: "雇用コスト指数（賃金）", cat: "賃金インフレ",
+    units: "pc1", freq: "q", fmt: "pct", goodWhenDown: true,
+    note: "前年比・四半期" },
+  { id: "CES0500000003", name: "平均時給（民間）", cat: "賃金インフレ",
+    units: "pc1", freq: "m", fmt: "pct", goodWhenDown: true,
+    note: "前年比" },
+];
+
+const CATEGORIES = ["インフレ動向", "雇用状況", "賃金インフレ"];
+/* freq → [取得開始の遡り月数, スパークラインに描く点数] */
+const FREQ_CONF = { m: [30, 24], w: [14, 52], q: [42, 12] };
+
+/* ── フォーマッタ ──
+ * 差分は表示と同じ丸め精度で計算する（元データの端数で
+ * 「3.3 → 3.4 なのに 0.0pt」のような矛盾を出さないため）。
+ */
+function toDisplay(s, v) {
+  const scaled = s.fmt === "man10" ? v / 10       // PAYEMS: 千人 → 万人
+               : s.fmt === "man"   ? v / 10000    // ICSA: 件 → 万件
+               : v;
+  return Math.round(scaled * 10) / 10;
+}
+function displayUnit(s) {
+  return s.fmt === "man10" ? "万人" : s.fmt === "man" ? "万件" : "%";
+}
+function deltaUnit(s) {
+  return s.fmt === "pct" ? "pt" : displayUnit(s);
+}
+function fmtValue(s, v) {
+  return [toDisplay(s, v).toFixed(1), displayUnit(s)];
+}
+function fmtDate(s, iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  if (s.freq === "q") return `${y}年Q${Math.floor((m - 1) / 3) + 1}`;
+  if (s.freq === "w") return `${m}/${d}週`;
+  return `${y}年${m}月`;
+}
+function startDate(s) {
+  const d = new Date();
+  d.setMonth(d.getMonth() - FREQ_CONF[s.freq][0]);
+  return d.toISOString().slice(0, 10);
+}
+
+/* ── DOM構築 ── */
+const sectionsEl = document.getElementById("sections");
+const cards = {};
+for (const cat of CATEGORIES) {
+  const sec = document.createElement("section");
+  sec.innerHTML = `<h2>${cat}</h2>`;
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  sec.appendChild(grid);
+  sectionsEl.appendChild(sec);
+  for (const s of SERIES.filter(x => x.cat === cat)) {
+    const card = document.createElement("div");
+    card.className = "card loading";
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="card-label">${s.name}</span>
+        <span class="card-sid">${s.id}</span>
+      </div>
+      <div class="card-value-row">
+        <span class="card-value">—</span><span class="card-unit"></span>
+      </div>
+      <div class="card-meta">${s.note || "&nbsp;"}</div>
+      <div class="card-delta">&nbsp;</div>
+      <svg class="spark" preserveAspectRatio="none"></svg>`;
+    card.addEventListener("click", (e) => {
+      if (e.target.closest("svg")) return; // スパークライン操作中の誤クリック防止
+      window.open("https://fred.stlouisfed.org/series/" + s.id, "_blank");
+    });
+    grid.appendChild(card);
+    cards[s.id] = card;
+  }
+}
+
+/* ── スパークライン描画（2pxライン + 10%ウォッシュ + 最新点アクセント） ── */
+const SPX_W = 240, SPX_H = 52, PAD = 6;
+
+function drawSpark(svg, s, obs) {
+  const pts = obs.slice(-FREQ_CONF[s.freq][1]);
+  if (pts.length < 2) { svg.innerHTML = ""; return; }
+  const vals = pts.map(p => p.value);
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = (max - min) || 1;
+  const x = i => PAD + (i / (pts.length - 1)) * (SPX_W - 2 * PAD);
+  const y = v => (SPX_H - PAD) - ((v - min) / span) * (SPX_H - 2 * PAD);
+  const line = pts.map((p, i) => `${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" ");
+  const lastX = x(pts.length - 1), lastY = y(vals[vals.length - 1]);
+
+  svg.setAttribute("viewBox", `0 0 ${SPX_W} ${SPX_H}`);
+  svg.innerHTML = `
+    <polygon points="${PAD},${SPX_H - PAD} ${line} ${SPX_W - PAD},${SPX_H - PAD}"
+             fill="var(--spark-wash)"/>
+    <polyline points="${line}" fill="none" stroke="var(--spark-line)"
+              stroke-width="2" stroke-linejoin="round" stroke-linecap="round"
+              vector-effect="non-scaling-stroke"/>
+    <circle cx="${lastX}" cy="${lastY}" r="4" fill="var(--spark-accent)"
+            stroke="var(--surface)" stroke-width="2"/>
+    <line class="hover-line" x1="0" x2="0" y1="${PAD}" y2="${SPX_H - PAD}"
+          stroke="var(--grid)" stroke-width="1" visibility="hidden"/>
+    <circle class="hover-dot" r="3.5" fill="var(--spark-accent)"
+            stroke="var(--surface)" stroke-width="2" visibility="hidden"/>`;
+
+  // ホバー: 最近傍点にツールチップ
+  const tooltip = document.getElementById("tooltip");
+  const hLine = svg.querySelector(".hover-line");
+  const hDot = svg.querySelector(".hover-dot");
+  svg.addEventListener("pointermove", (e) => {
+    const rect = svg.getBoundingClientRect();
+    const relX = (e.clientX - rect.left) / rect.width * SPX_W;
+    const i = Math.max(0, Math.min(pts.length - 1,
+      Math.round((relX - PAD) / (SPX_W - 2 * PAD) * (pts.length - 1))));
+    const px = x(i), py = y(pts[i].value);
+    hLine.setAttribute("x1", px); hLine.setAttribute("x2", px);
+    hLine.setAttribute("visibility", "visible");
+    hDot.setAttribute("cx", px); hDot.setAttribute("cy", py);
+    hDot.setAttribute("visibility", "visible");
+    const [val, unit] = fmtValue(s, pts[i].value);
+    tooltip.innerHTML =
+      `<div class="t-date">${fmtDate(s, pts[i].date)}</div><div class="t-val">${val}${unit}</div>`;
+    tooltip.style.display = "block";
+    tooltip.style.left = Math.min(e.clientX + 12, window.innerWidth - 110) + "px";
+    tooltip.style.top = (e.clientY - 44) + "px";
+  });
+  svg.addEventListener("pointerleave", () => {
+    tooltip.style.display = "none";
+    hLine.setAttribute("visibility", "hidden");
+    hDot.setAttribute("visibility", "hidden");
+  });
+}
+
+/* ── カード更新 ── */
+function renderCard(s, payload) {
+  const card = cards[s.id];
+  card.classList.remove("loading");
+  const obs = payload.observations;
+  if (!obs || obs.length === 0) {
+    card.querySelector(".card-delta").innerHTML = `<span class="err">データなし</span>`;
+    return;
+  }
+  const latest = obs[obs.length - 1];
+  const prev = obs.length >= 2 ? obs[obs.length - 2] : null;
+
+  const [val, unit] = fmtValue(s, latest.value);
+  card.querySelector(".card-value").textContent = val;
+  card.querySelector(".card-unit").textContent = unit;
+
+  let meta = `${fmtDate(s, latest.date)}時点`;
+  if (s.note) meta += ` ・ ${s.note}`;
+  if (payload.stale) meta += `<span class="chip">キャッシュ</span>`;
+  card.querySelector(".card-meta").innerHTML = meta;
+
+  if (prev) {
+    const diff = Math.round((toDisplay(s, latest.value) - toDisplay(s, prev.value)) * 10) / 10;
+    const [pv, pu] = fmtValue(s, prev.value);
+    if (diff === 0) {
+      card.querySelector(".card-delta").innerHTML =
+        `<span class="dir">→ 変わらず</span>　前回 ${pv}${pu}`;
+    } else {
+      const improving = s.goodWhenDown ? diff < 0 : diff > 0;
+      const arrow = diff > 0 ? "▲" : "▼";
+      card.querySelector(".card-delta").innerHTML =
+        `<span class="dir ${improving ? "good" : "bad"}">${arrow} ${Math.abs(diff).toFixed(1)}${deltaUnit(s)}</span>` +
+        `　前回 ${pv}${pu}`;
+    }
+  }
+  drawSpark(card.querySelector(".spark"), s, obs);
+}
+
+function renderError(s, err) {
+  const card = cards[s.id];
+  card.classList.remove("loading");
+  const msg = err === "no_api_key" ? "APIキー未設定"
+            : err === "fred_rejected" ? "APIキーが無効"
+            : "取得エラー";
+  card.querySelector(".card-delta").innerHTML = `<span class="err">${msg}</span>`;
+}
+
+/* ── データ取得 ──
+ * GitHub Pages では Actions が生成した静的 data.json を読む。
+ * ローカル(serve.py)には data.json が無いので /api のライブ取得になる。
+ */
+const banner = document.getElementById("banner");
+
+async function loadBundle(force) {
+  try {
+    const res = await fetch("data.json" + (force ? "?t=" + Date.now() : ""),
+                            { cache: "no-store" });
+    if (!res.ok) return null;
+    const bundle = await res.json();
+    return bundle && bundle.series ? bundle : null;
+  } catch {
+    return null;
+  }
+}
+
+async function loadAll(force) {
+  const btn = document.getElementById("refresh");
+  btn.disabled = true;
+  banner.classList.remove("show");
+
+  const bundle = await loadBundle(force);
+  if (bundle) {
+    for (const s of SERIES) {
+      const payload = bundle.series[s.id];
+      if (payload) renderCard(s, payload);
+      else renderError(s, "missing");
+    }
+    document.getElementById("updated").textContent =
+      "データ更新: " + new Date(bundle.generated_at)
+        .toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" });
+    btn.disabled = false;
+    return;
+  }
+
+  let noKey = false, badKey = false;
+
+  await Promise.all(SERIES.map(async (s) => {
+    const url = `/api/series?id=${s.id}&units=${s.units}&start=${startDate(s)}`
+              + (force ? "&refresh=1" : "");
+    try {
+      const res = await fetch(url);
+      const data = await res.json();
+      if (res.ok) {
+        renderCard(s, data);
+      } else {
+        if (data.error === "no_api_key") noKey = true;
+        if (data.error === "fred_rejected") badKey = true;
+        renderError(s, data.error);
+      }
+    } catch {
+      renderError(s, "network");
+    }
+  }));
+
+  if (noKey || badKey) {
+    banner.innerHTML = `
+      <strong>FRED APIキーの設定が必要です${badKey ? "（現在のキーは無効です）" : ""}。</strong><br>
+      1. <a href="https://fredaccount.stlouisfed.org/apikeys" target="_blank">FREDのAPIキー発行ページ</a>で無料アカウントを作成しキーを取得<br>
+      2. このフォルダの <code>config.example.json</code> を <code>config.json</code> にコピーし、キーを記入<br>
+      3. <code>python3 serve.py</code> を再起動してこのページを再読み込み`;
+    banner.classList.add("show");
+  }
+
+  document.getElementById("updated").textContent =
+    "取得: " + new Date().toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" });
+  btn.disabled = false;
+}
+
+document.getElementById("refresh").addEventListener("click", () => loadAll(true));
+loadAll(false);
+</script>
+</body>
+</html>
