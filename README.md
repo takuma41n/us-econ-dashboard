@@ -59,6 +59,24 @@ GitHub Actions が6時間ごとにFREDからデータを取得し、GitHub Pages
   ライブAPIを使う二段構え
 - 手動更新: リポジトリの Actions タブ → "Update data and deploy" → Run workflow
 
+## 指標更新のプッシュ通知（ntfy.sh）
+
+指標に**新しい観測値が出たときだけ**、スマホに無料でプッシュ通知が届きます
+（ワークフローは1日4回動きますが、値が変わらなければ通知しません）。
+
+仕組み: Actions がデプロイ前に公開中の `data.json` を保存し、デプロイ後に
+`notify_update.py` が新旧の最新観測日を比較 → 更新された指標をまとめて
+ntfy.sh にPOST。通知タップでダッシュボードが開きます。
+
+セットアップ（スマホ側・初回のみ）:
+
+1. App Store / Google Play で「ntfy」アプリをインストール
+2. アプリで「＋」→ リポジトリ Secrets の `NTFY_TOPIC` と同じトピック名を購読
+
+- トピック名は推測されにくいランダム文字列にして Secrets（`NTFY_TOPIC`）に保存
+  （ntfy.sh はトピック名を知っていれば誰でも購読できるため、実質パスワード扱い）
+- 通知の失敗はデプロイに影響しません（notify_update.py は常に exit 0）
+
 ## ファイル構成
 
 ```
@@ -67,6 +85,7 @@ fetch_data.py        # GitHub Actions用データ取得スクリプト → data.
 index.html           # ダッシュボード本体（自己完結・外部CDNなし）
 config.json          # あなたのAPIキー（各自作成・コミットしない）
 config.example.json  # 設定のひな形
+notify_update.py     # 指標更新時のntfy.shプッシュ通知（GitHub Actions用）
 cache/               # APIレスポンスのキャッシュ（自動生成、削除可）
 .github/workflows/update-data.yml  # 6時間ごとの自動更新＆デプロイ
 ```

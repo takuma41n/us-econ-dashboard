@@ -31,6 +31,10 @@ jobs:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
         run: python3 fetch_data.py --out _site/data.json
 
+      - name: Save previous data for update detection
+        # デプロイ前に公開中の data.json を確保（初回404は許容）
+        run: curl -fsS https://takuma41n.github.io/us-econ-dashboard/data.json -o prev_data.json || true
+
       - name: Assemble site
         run: cp index.html _site/
 
@@ -42,3 +46,9 @@ jobs:
 
       - id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Notify if indicators updated
+        # 新しい観測値が出た指標があるときだけ ntfy.sh にプッシュ通知
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 notify_update.py --new _site/data.json --old prev_data.json
