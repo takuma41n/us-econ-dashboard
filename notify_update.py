@@ -62,13 +62,13 @@ def build_message(old_bundle, new_bundle):
     return "\n".join(lines)
 
 
-def send(topic, message):
+def send(topic, message, title="米経済指標 更新", tags=("bar_chart",)):
     body = json.dumps({
         "topic": topic,
-        "title": "米経済指標 更新",
+        "title": title,
         "message": message,
         "click": DASHBOARD_URL,
-        "tags": ["bar_chart"],
+        "tags": list(tags),
     }).encode("utf-8")
     req = urllib.request.Request(NTFY_URL, data=body,
                                  headers={"Content-Type": "application/json"})

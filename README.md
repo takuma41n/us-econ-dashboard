@@ -64,6 +64,8 @@ GitHub Actions が6時間ごとにFREDからデータを取得し、GitHub Pages
 
 指標に**新しい観測値が出たときだけ**、スマホに無料でプッシュ通知が届きます
 （ワークフローは1日4回動きますが、値が変わらなければ通知しません）。
+さらに、**公開予定日の当日朝（日本時間6時ごろ）**にも「本日公開の米経済指標」の
+予告通知が届きます（`notify_release_day.py`、対象がある日のみ）。
 
 仕組み: Actions がデプロイ前に公開中の `data.json` を保存し、デプロイ後に
 `notify_update.py` が新旧の最新観測日を比較 → 更新された指標をまとめて
@@ -87,6 +89,7 @@ index.html           # ダッシュボード本体（自己完結・外部CDNな
 config.json          # あなたのAPIキー（各自作成・コミットしない）
 config.example.json  # 設定のひな形
 notify_update.py     # 指標更新時のntfy.shプッシュ通知（GitHub Actions用）
+notify_release_day.py # 公開予定日の当日朝の予告通知（GitHub Actions用）
 cache/               # APIレスポンスのキャッシュ（自動生成、削除可）
 .github/workflows/update-data.yml  # 6時間ごとの自動更新＆デプロイ
 ```

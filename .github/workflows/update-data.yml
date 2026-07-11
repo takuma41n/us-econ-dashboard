@@ -52,3 +52,9 @@ jobs:
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python3 notify_update.py --new _site/data.json --old prev_data.json
+
+      - name: Notify today's scheduled releases
+        # 公開予定日の当日朝（日本時間5〜8時台の実行=20:45 UTCの回）に予告通知
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 notify_release_day.py --data _site/data.json
