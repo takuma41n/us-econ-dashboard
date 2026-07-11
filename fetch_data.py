@@ -16,6 +16,8 @@ import urllib.parse
 import urllib.request
 
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_SERIES_RELEASE_URL = "https://api.stlouisfed.org/fred/series/release"
+FRED_RELEASE_DATES_URL = "https://api.stlouisfed.org/fred/release/dates"
 
 # (series_id, units, 遡り月数) — index.html の SERIES 定義と対応
 SERIES = [
@@ -53,18 +55,22 @@ def start_date(months_back):
     return f"{y:04d}-{m:02d}-01"
 
 
+def fred_get(url, params):
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{url}?{qs}",
+                                 headers={"User-Agent": "econ-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def fetch(api_key, series_id, units, months_back):
-    params = urllib.parse.urlencode({
+    data = fred_get(FRED_URL, {
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
         "units": units,
         "observation_start": start_date(months_back),
     })
-    req = urllib.request.Request(f"{FRED_URL}?{params}",
-                                 headers={"User-Agent": "econ-dashboard/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
     return {
         "series_id": series_id,
         "units": units,
@@ -74,6 +80,37 @@ def fetch(api_key, series_id, units, months_back):
             if o.get("value") not in (".", "", None)
         ],
     }
+
+
+def fetch_release_info(api_key, series_id, _memo={}):
+    """系列の公開日(直近)と次回公開予定日を返す。取得失敗は None。"""
+    rel = fred_get(FRED_SERIES_RELEASE_URL, {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+    })["releases"][0]
+    rid = rel["id"]
+    if rid in _memo:
+        return _memo[rid]
+    time.sleep(0.5)
+    data = fred_get(FRED_RELEASE_DATES_URL, {
+        "release_id": rid,
+        "api_key": api_key,
+        "file_type": "json",
+        "include_release_dates_with_no_data": "true",
+        "realtime_end": "9999-12-31",
+        "sort_order": "desc",
+        "limit": 60,
+    })
+    today = datetime.date.today().isoformat()
+    dates = [d["date"] for d in data.get("release_dates", [])]  # 降順
+    info = {
+        "name": rel.get("name", ""),
+        "last_date": next((d for d in dates if d <= today), None),
+        "next_date": min((d for d in dates if d > today), default=None),
+    }
+    _memo[rid] = info
+    return info
 
 
 def main():
@@ -93,10 +130,16 @@ def main():
     for sid, units, months_back in SERIES:
         bundle["series"][sid] = fetch(api_key, sid, units, months_back)
         n = len(bundle["series"][sid]["observations"])
-        print(f"  {sid}: {n} obs")
         if n == 0:
             sys.exit(f"{sid} の観測値が0件 — 異常なので中断します")
         time.sleep(0.5)  # FREDレート制限への配慮
+        try:
+            release = fetch_release_info(api_key, sid)
+            bundle["series"][sid]["release"] = release
+            print(f"  {sid}: {n} obs, 公開 {release['last_date']} / 次回 {release['next_date']}")
+        except Exception as e:  # 公開日はおまけ情報なので失敗しても続行
+            print(f"  {sid}: {n} obs, リリース日取得失敗: {e}")
+        time.sleep(0.5)
 
     out_dir = os.path.dirname(args.out)
     if out_dir:
