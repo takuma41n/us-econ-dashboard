@@ -147,6 +147,9 @@
     margin-left: 6px;
   }
 
+  .card-release { font-size: 11px; color: var(--text-muted); }
+  .card-release .next { white-space: nowrap; }
+
   .card-delta { font-size: 12.5px; color: var(--text-secondary); }
   .card-delta .dir { font-weight: 650; }
   .card-delta .dir.good { color: var(--good); }
@@ -260,6 +263,16 @@ function fmtDate(s, iso) {
   if (s.freq === "w") return `${m}/${d}週`;
   return `${y}年${m}月`;
 }
+function fmtReleaseDate(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return y === new Date().getFullYear() ? `${m}/${d}` : `${y}/${m}/${d}`;
+}
+function daysUntil(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((new Date(y, m - 1, d) - today) / 86400000);
+}
 function startDate(s) {
   const d = new Date();
   d.setMonth(d.getMonth() - FREQ_CONF[s.freq][0]);
@@ -289,6 +302,7 @@ for (const cat of CATEGORIES) {
       </div>
       <div class="card-meta">${s.note || "&nbsp;"}</div>
       <div class="card-delta">&nbsp;</div>
+      <div class="card-release" hidden></div>
       <svg class="spark" preserveAspectRatio="none"></svg>`;
     card.addEventListener("click", (e) => {
       if (e.target.closest("svg")) return; // スパークライン操作中の誤クリック防止
@@ -390,6 +404,25 @@ function renderCard(s, payload) {
         `　前回 ${pv}${pu}`;
     }
   }
+
+  const relEl = card.querySelector(".card-release");
+  const rel = payload.release;
+  if (rel && (rel.last_date || rel.next_date)) {
+    const parts = [];
+    if (rel.last_date) parts.push(`公開 ${fmtReleaseDate(rel.last_date)}`);
+    if (rel.next_date) {
+      const days = daysUntil(rel.next_date);
+      const when = days === 0 ? "本日" : `あと${days}日`;
+      parts.push(`<span class="next">次回 ${fmtReleaseDate(rel.next_date)}（${when}）</span>`);
+    } else {
+      parts.push("次回 未定");
+    }
+    relEl.innerHTML = parts.join(" ・ ");
+    relEl.hidden = false;
+  } else {
+    relEl.hidden = true;
+  }
+
   drawSpark(card.querySelector(".spark"), s, obs);
 }
 

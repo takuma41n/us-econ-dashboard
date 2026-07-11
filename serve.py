@@ -24,6 +24,8 @@ PORT = 8390
 CACHE_TTL = 3600  # 秒
 
 FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+FRED_SERIES_RELEASE_URL = "https://api.stlouisfed.org/fred/series/release"
+FRED_RELEASE_DATES_URL = "https://api.stlouisfed.org/fred/release/dates"
 
 # 開放プロキシ化を防ぐため、取得できる系列は掲載指標に限定する
 ALLOWED_SERIES = {
@@ -67,18 +69,22 @@ def write_cache(series_id, units, payload):
         json.dump(payload, f, ensure_ascii=False)
 
 
+def fred_get(url, params):
+    qs = urllib.parse.urlencode(params)
+    req = urllib.request.Request(f"{url}?{qs}",
+                                 headers={"User-Agent": "econ-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def fetch_fred(api_key, series_id, units, start):
-    params = urllib.parse.urlencode({
+    data = fred_get(FRED_URL, {
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
         "units": units,
         "observation_start": start,
     })
-    req = urllib.request.Request(f"{FRED_URL}?{params}",
-                                 headers={"User-Agent": "econ-dashboard/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
     observations = [
         {"date": o["date"], "value": float(o["value"])}
         for o in data.get("observations", [])
@@ -90,6 +96,42 @@ def fetch_fred(api_key, series_id, units, start):
         "fetched_at": int(time.time()),
         "observations": observations,
     }
+
+
+# release_id → {"fetched_at", "info"} のメモ。Employment Situation を
+# 共有する3系列（UNRATE/PAYEMS/CES0500000003）の重複呼び出しを避ける。
+_release_memo = {}
+
+
+def fetch_release_info(api_key, series_id):
+    """系列の公開日(直近)と次回公開予定日を返す。"""
+    rel = fred_get(FRED_SERIES_RELEASE_URL, {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+    })["releases"][0]
+    rid = rel["id"]
+    memo = _release_memo.get(rid)
+    if memo and time.time() - memo["fetched_at"] < CACHE_TTL:
+        return memo["info"]
+    data = fred_get(FRED_RELEASE_DATES_URL, {
+        "release_id": rid,
+        "api_key": api_key,
+        "file_type": "json",
+        "include_release_dates_with_no_data": "true",
+        "realtime_end": "9999-12-31",
+        "sort_order": "desc",
+        "limit": 60,
+    })
+    today = time.strftime("%Y-%m-%d")
+    dates = [d["date"] for d in data.get("release_dates", [])]  # 降順
+    info = {
+        "name": rel.get("name", ""),
+        "last_date": next((d for d in dates if d <= today), None),
+        "next_date": min((d for d in dates if d > today), default=None),
+    }
+    _release_memo[rid] = {"fetched_at": time.time(), "info": info}
+    return info
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -149,6 +191,10 @@ class Handler(SimpleHTTPRequestHandler):
 
         try:
             payload = fetch_fred(api_key, series_id, units, start)
+            try:
+                payload["release"] = fetch_release_info(api_key, series_id)
+            except Exception:
+                pass  # 公開日はおまけ情報。失敗しても観測値は返す
             write_cache(series_id, units, payload)
             return self.send_json(200, payload)
         except urllib.error.HTTPError as e:
