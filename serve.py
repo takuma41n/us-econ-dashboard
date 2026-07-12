@@ -17,7 +17,7 @@ import urllib.request
 import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-from fetch_data import fetch_nowcast
+from fetch_data import fetch_nowcast, fetch_usdjpy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -47,6 +47,7 @@ ALLOWED_SERIES = {
     "SP500",           # S&P500
     "VIXCLS",          # VIX
     "BAMLH0A0HYM2",    # ハイイールド債OAS
+    "NIKKEI225",       # 日経225
 }
 ALLOWED_UNITS = {"lin", "pc1", "chg"}
 
@@ -171,6 +172,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_series(urllib.parse.parse_qs(parsed.query))
         elif parsed.path == "/api/nowcast":
             self.handle_nowcast(urllib.parse.parse_qs(parsed.query))
+        elif parsed.path == "/api/usdjpy":
+            self.handle_usdjpy(urllib.parse.parse_qs(parsed.query))
         elif parsed.path == "/data.json":
             # ローカルでは常にライブAPIを使わせる（古い静的JSONの誤読防止）
             self.send_json(404, {"error": "not_found"})
@@ -198,6 +201,25 @@ class Handler(SimpleHTTPRequestHandler):
                 cached["stale"] = True
                 return self.send_json(200, cached)
             return self.send_json(502, {"error": "nowcast_unavailable"})
+
+    def handle_usdjpy(self, qs):
+        """ドル円（ECB参照レート）のプロキシ。形はFRED系列と同じ。"""
+        force = (qs.get("refresh") or ["0"])[0] == "1"
+        cached = read_cache("USDJPY", "ecb")
+        if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
+            return self.send_json(200, cached)
+        try:
+            payload = fetch_usdjpy()
+            if payload is None:
+                raise ValueError("no data")
+            payload["fetched_at"] = int(time.time())
+            write_cache("USDJPY", "ecb", payload)
+            return self.send_json(200, payload)
+        except Exception:
+            if cached:
+                cached["stale"] = True
+                return self.send_json(200, cached)
+            return self.send_json(502, {"error": "usdjpy_unavailable"})
 
     def handle_series(self, qs):
         series_id = (qs.get("id") or [""])[0].upper()
