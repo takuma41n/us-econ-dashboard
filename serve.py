@@ -44,6 +44,9 @@ ALLOWED_SERIES = {
     "DGS1",            # 1年債利回り
     "DGS2",            # 2年債利回り
     "EXPINF1YR",       # 1年期待インフレ
+    "SP500",           # S&P500
+    "VIXCLS",          # VIX
+    "BAMLH0A0HYM2",    # ハイイールド債OAS
 }
 ALLOWED_UNITS = {"lin", "pc1", "chg"}
 

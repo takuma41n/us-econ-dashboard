@@ -506,6 +506,9 @@ const FORECAST_SERIES = [
   { id: "DGS1",      months: 3 },   // 1年債利回り
   { id: "DGS2",      months: 3 },   // 2年債利回り
   { id: "EXPINF1YR", months: 6 },   // 1年期待インフレ
+  { id: "SP500",        months: 15 },  // S&P500（125日MA・52週高値用）
+  { id: "VIXCLS",       months: 2 },   // VIX
+  { id: "BAMLH0A0HYM2", months: 2 },   // ハイイールド債OAS
 ];
 
 function monthsBackISO(n) {
@@ -567,13 +570,37 @@ function computeForecast(fs) {
              spread2y: (dgs2 - effr) * 100 };
   }
 
-  return { momentum, policy, path };
+  // 株式市場センチメント: モメンタム相場=+100 ↔ 急落恐怖=−100
+  // CNN Fear & Greed と同系の成分をFREDデータで自前計算（アンカーは歴史的水準の固定値）
+  let market = null;
+  const sp = levels("SP500"), vix = lastVal("VIXCLS"), hyoas = lastVal("BAMLH0A0HYM2");
+  if (sp.length >= 252 && vix != null && hyoas != null) {
+    const clamp1 = v => Math.max(-1, Math.min(1, v));
+    const price = sp[sp.length - 1];
+    const ma125 = sp.slice(-125).reduce((a, b) => a + b, 0) / 125;
+    const hi52 = Math.max(...sp.slice(-252));
+    const momPct = (price / ma125 - 1) * 100;   // 125日線乖離（%）
+    const ddPct = (price / hi52 - 1) * 100;     // 52週高値からの下落率（%）
+    const c = {
+      momentum: clamp1(momPct / 8),             // ±8%乖離でフルスケール
+      drawdown: clamp1(1 + ddPct / 10),         // 高値圏=+1、−10%調整=0、−20%弱気=−1
+      vix: clamp1((22 - vix) / 10),             // VIX12=+1、22=0、32=−1
+      credit: clamp1((4.5 - hyoas) / 2),        // OAS2.5%=+1、4.5%=0、6.5%=−1
+    };
+    market = {
+      score: 100 * (0.3 * c.momentum + 0.2 * c.drawdown + 0.3 * c.vix + 0.2 * c.credit),
+      c, price, ma125, hi52, momPct, ddPct, vix, hyoas,
+    };
+  }
+
+  return { momentum, policy, path, market };
 }
 
 /* ── 半円ゲージ（SVG） ──
  * 針の位置+ゾーンラベルが本体。色（緑=沈静化方向/赤=圧力方向）は補助。
+ * flip=true で緑/赤を左右反転（右がプラス方向で良い意味のゲージ用）。
  */
-function gaugeSVG(score, domain) {
+function gaugeSVG(score, domain, flip) {
   const W = 250, H = 128, CX = 125, CY = 112, R = 92;
   const pt = (s, r) => {
     const t = Math.max(-1, Math.min(1, s / domain));
@@ -587,11 +614,13 @@ function gaugeSVG(score, domain) {
   const zone = domain * 0.2, g = domain * 0.012;  // 中立域±20% / ゾーン間は地色の隙間
   const [nx, ny] = pt(score, R - 15);
   const [tx0, ty0] = pt(0, R - 5), [tx1, ty1] = pt(0, R + 5);
+  const leftColor = flip ? "var(--bad)" : "var(--good)";
+  const rightColor = flip ? "var(--good)" : "var(--bad)";
   return `
   <svg class="gauge-svg" viewBox="0 0 ${W} ${H}" role="img">
-    <path d="${arc(-domain, -zone - g)}" fill="none" stroke="var(--good)" stroke-opacity="0.3" stroke-width="10"/>
+    <path d="${arc(-domain, -zone - g)}" fill="none" stroke="${leftColor}" stroke-opacity="0.3" stroke-width="10"/>
     <path d="${arc(-zone + g, zone - g)}" fill="none" stroke="var(--grid)" stroke-width="10"/>
-    <path d="${arc(zone + g, domain)}" fill="none" stroke="var(--bad)" stroke-opacity="0.3" stroke-width="10"/>
+    <path d="${arc(zone + g, domain)}" fill="none" stroke="${rightColor}" stroke-opacity="0.3" stroke-width="10"/>
     <line x1="${tx0.toFixed(1)}" y1="${ty0.toFixed(1)}" x2="${tx1.toFixed(1)}" y2="${ty1.toFixed(1)}"
           stroke="var(--text-muted)" stroke-width="1"/>
     <line x1="${CX}" y1="${CY}" x2="${nx.toFixed(1)}" y2="${ny.toFixed(1)}"
@@ -608,6 +637,7 @@ const forecastEl = document.getElementById("forecast");
 const FX_CARDS = [
   ["fx-policy",   "金融政策バイアス（タカ・ハト）", "合成スコア", true],
   ["fx-momentum", "インフレ・モメンタム",           "3ヶ月年率 − 前年比", true],
+  ["fx-market",   "株式市場センチメント",           "モメンタム ↔ 急落恐怖", true],
   ["fx-path",     "市場が織り込む金利パス",         "国債利回り逆算", false],
   ["fx-nc-cpi",   "次回コアCPI予想",                "CLEVELAND FED", false],
   ["fx-nc-pce",   "次回コアPCE予想",                "CLEVELAND FED", false],
@@ -689,6 +719,24 @@ function renderMomentumCard(m) {
     </div>
     <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
     <div class="card-meta">コアCPI・コアPCEの「3ヶ月年率 − 前年比」の平均</div>`);
+}
+
+function renderMarketCard(mk) {
+  if (!mk) return fxError("fx-market");
+  const s = mk.score;
+  const [label, cls] =
+      s < -60 ? ["急落恐怖（パニック）", "bad"]
+    : s < -20 ? ["リスクオフ（警戒）", "bad"]
+    : s <= 20 ? ["中立", ""]
+    : s <= 60 ? ["リスクオン", "good"]
+    :           ["強いモメンタム", "good"];
+  fxCardBody("fx-market", `
+    ${gaugeSVG(s, 100, true)}
+    <div class="card-value-row">
+      <span class="card-value">${s >= 0 ? "+" : ""}${Math.round(s)}</span>
+    </div>
+    <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-meta">S&amp;P500トレンド 50% + VIX 30% + 信用スプレッド 20%</div>`);
 }
 
 function renderPathCard(p) {
@@ -796,6 +844,23 @@ function renderBreakdown(fx, nc) {
       <tbody>${row("コアCPI", m.cpi)}${row("コアPCE", m.pce)}</tbody>
     </table>`;
   }
+  const mk = fx.market;
+  if (mk) {
+    const mrow = (name, val, comp, w) =>
+      `<tr><td>${name}</td><td>${val}</td><td>${w}%</td><td>${pp(comp * w, 0)}</td></tr>`;
+    html += `
+    <h3>株式市場センチメントの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>成分</th><th>値</th><th>重み</th><th>寄与</th></tr></thead>
+      <tbody>
+        ${mrow(`価格モメンタム（S&amp;P500 ${Math.round(mk.price).toLocaleString()} の125日線乖離）`, `${pp(mk.momPct)}%`, mk.c.momentum, 30)}
+        ${mrow("52週高値からの下落率", `${pp(mk.ddPct)}%`, mk.c.drawdown, 20)}
+        ${mrow("恐怖指数（VIX）", mk.vix.toFixed(1), mk.c.vix, 30)}
+        ${mrow("信用ストレス（ハイイールド債OAS）", `${mk.hyoas.toFixed(2)}%`, mk.c.credit, 20)}
+        <tr><td>合成スコア</td><td></td><td></td><td><strong>${pp(mk.score, 0)}</strong></td></tr>
+      </tbody>
+    </table>`;
+  }
   html += `
   <div class="bd-note">
     計算方法: テイラールールは i* = π + r* + 0.5(π−2) + (u*−u)。π=コアPCE前年比、
@@ -803,6 +868,9 @@ function renderBreakdown(fx, nc) {
     金利パスは「1年債利回り ≈ 今後1年の政策金利の平均」という線形パス近似で
     Δ ≈ 2×(1年債 − FF金利)。タームプレミアムを含む概算であり、FF金利先物ほど正確ではない。
     次回発表予想の出典: ${nc && nc.source ? nc.source : "Federal Reserve Bank of Cleveland, Inflation Nowcasting"}。
+    株式市場センチメントは各成分を固定アンカーで±1に正規化した加重平均
+    （125日線乖離±8%、下落率0〜−20%、VIX 12〜32、ハイイールドOAS 2.5〜6.5%でフルスケール）。
+    +100=モメンタム相場、−100=急落恐怖。
     いずれも機械的な参考値であり、投資判断はご自身で。
   </div>`;
   body.innerHTML = html;
@@ -830,6 +898,7 @@ async function loadForecast(bundle, force) {
   const fx = computeForecast(fs);
   renderPolicyCard(fx.policy);
   renderMomentumCard(fx.momentum);
+  renderMarketCard(fx.market);
   renderPathCard(fx.path);
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
