@@ -30,6 +30,30 @@ SERIES = [
     ("CES0500000003", "pc1", 30),
 ]
 
+# 予測セクション用の系列（カード表示なし・リリース日不要）
+# index.html の FORECAST_SERIES 定義と対応
+FORECAST_SERIES = [
+    ("PCEPILFE", "lin", 30),      # コアPCE指数水準 → 3m/6m年率換算
+    ("CPILFESL", "lin", 30),      # コアCPI指数水準 → 同上
+    ("EFFR", "lin", 3),           # 実効FF金利
+    ("NROU", "lin", 18),          # 自然失業率（CBO・四半期）
+    ("DGS1", "lin", 3),           # 1年債利回り
+    ("DGS2", "lin", 3),           # 2年債利回り
+    ("EXPINF1YR", "lin", 6),      # 1年期待インフレ（クリーブランド連銀モデル）
+]
+
+# クリーブランド連銀インフレ・ナウキャスト（公開JSON・認証不要）
+NOWCAST_URLS = {
+    "mom": "https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_month.json?sc_lang=en",
+    "yoy": "https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_year.json?sc_lang=en",
+}
+NOWCAST_MEASURES = {
+    "CPI Inflation": "cpi",
+    "Core CPI Inflation": "cpi_core",
+    "PCE Inflation": "pce",
+    "Core PCE Inflation": "pce_core",
+}
+
 
 def load_api_key():
     key = os.environ.get("FRED_API_KEY", "").strip()
@@ -64,13 +88,17 @@ def fred_get(url, params):
 
 
 def fetch(api_key, series_id, units, months_back):
-    data = fred_get(FRED_URL, {
+    params = {
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
         "units": units,
         "observation_start": start_date(months_back),
-    })
+    }
+    if series_id == "NROU":
+        # CBO推計は将来四半期の予測値も返すため、今日までに限定する
+        params["observation_end"] = datetime.date.today().isoformat()
+    data = fred_get(FRED_URL, params)
     return {
         "series_id": series_id,
         "units": units,
@@ -113,6 +141,75 @@ def fetch_release_info(api_key, series_id, _memo={}):
     return info
 
 
+def _last_value(dataset_entry):
+    """FusionCharts系列の最後の非空値を float で返す。なければ None。"""
+    for point in reversed(dataset_entry.get("data") or []):
+        v = point.get("value")
+        if v not in ("", None):
+            try:
+                return float(v)
+            except ValueError:
+                return None
+    return None
+
+
+def _parse_nowcast_charts(charts, kind, months):
+    """クリーブランド連銀ナウキャストJSON（月別チャートの配列）を months に集約する。
+
+    kind は "mom"（前月比）か "yoy"（前年比）。直近4ヶ月分だけ見る。
+    """
+    for chart in charts[-4:]:
+        sub = chart.get("chart", {}).get("subcaption", "")  # 例 "2026-7"
+        try:
+            y, m = sub.split("-")
+            month = f"{int(y):04d}-{int(m):02d}"
+        except ValueError:
+            continue
+        entry = months.setdefault(month, {})
+        for ds in chart.get("dataset", []):
+            name = ds.get("seriesname", "")
+            actual = name.startswith("Actual ")
+            key = NOWCAST_MEASURES.get(name.removeprefix("Actual "))
+            if key is None:
+                continue
+            v = _last_value(ds)
+            if v is None:
+                continue
+            measure = entry.setdefault(key, {})
+            measure["actual_" + kind if actual else kind] = round(v, 2)
+
+
+def fetch_nowcast():
+    """クリーブランド連銀のインフレ・ナウキャストを取得して整形する。
+
+    返り値: {"as_of": "YYYY-MM-DD", "months": [{"month": "YYYY-MM",
+             "cpi": {"mom": x, "yoy": y, ...}, "cpi_core": ..., ...}]}
+    取得・解析に失敗したら None（呼び出し側でフォールバック）。
+    """
+    months = {}
+    as_of = None
+    for kind, url in NOWCAST_URLS.items():
+        req = urllib.request.Request(url, headers={
+            # サイト側がスクリプトUAを弾くことがあるためブラウザ相当を名乗る
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            charts = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(charts, list) or not charts:
+            return None
+        comment = charts[-1].get("chart", {}).get("_comment", "")  # 例 "2026-07-10 00:00"
+        as_of = comment.split(" ")[0] or as_of
+        _parse_nowcast_charts(charts, kind, months)
+    if not months:
+        return None
+    return {
+        "as_of": as_of,
+        "source": "Federal Reserve Bank of Cleveland, Inflation Nowcasting",
+        "months": [dict(month=k, **v) for k, v in sorted(months.items())],
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data.json")
@@ -140,6 +237,28 @@ def main():
         except Exception as e:  # 公開日はおまけ情報なので失敗しても続行
             print(f"  {sid}: {n} obs, リリース日取得失敗: {e}")
         time.sleep(0.5)
+
+    # 予測セクション用の系列（units違いの再取得があるため別名前空間に格納）
+    bundle["forecast_series"] = {}
+    for sid, units, months_back in FORECAST_SERIES:
+        bundle["forecast_series"][sid] = fetch(api_key, sid, units, months_back)
+        n = len(bundle["forecast_series"][sid]["observations"])
+        print(f"  [forecast] {sid}: {n} obs")
+        if n == 0:
+            sys.exit(f"{sid} の観測値が0件 — 異常なので中断します")
+        time.sleep(0.5)
+
+    # クリーブランド連銀ナウキャスト（失敗してもビルドは止めない）
+    try:
+        bundle["nowcast"] = fetch_nowcast()
+        if bundle["nowcast"]:
+            print(f"  [nowcast] as of {bundle['nowcast']['as_of']}, "
+                  f"{len(bundle['nowcast']['months'])} months")
+        else:
+            print("  [nowcast] 解析失敗（フォールバック表示になります）")
+    except Exception as e:
+        bundle["nowcast"] = None
+        print(f"  [nowcast] 取得失敗: {e}（フォールバック表示になります）")
 
     out_dir = os.path.dirname(args.out)
     if out_dir:
