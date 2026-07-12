@@ -509,6 +509,7 @@ const FORECAST_SERIES = [
   { id: "SP500",        months: 15 },  // S&P500（125日MA・52週高値用）
   { id: "VIXCLS",       months: 2 },   // VIX
   { id: "BAMLH0A0HYM2", months: 2 },   // ハイイールド債OAS
+  { id: "NIKKEI225",    months: 15 },  // 日経225（125日MA・52週高値・実現ボラ用）
 ];
 
 function monthsBackISO(n) {
@@ -572,10 +573,10 @@ function computeForecast(fs) {
 
   // 株式市場センチメント: モメンタム相場=+100 ↔ 急落恐怖=−100
   // CNN Fear & Greed と同系の成分をFREDデータで自前計算（アンカーは歴史的水準の固定値）
+  const clamp1 = v => Math.max(-1, Math.min(1, v));
   let market = null;
   const sp = levels("SP500"), vix = lastVal("VIXCLS"), hyoas = lastVal("BAMLH0A0HYM2");
   if (sp.length >= 252 && vix != null && hyoas != null) {
-    const clamp1 = v => Math.max(-1, Math.min(1, v));
     const price = sp[sp.length - 1];
     const ma125 = sp.slice(-125).reduce((a, b) => a + b, 0) / 125;
     const hi52 = Math.max(...sp.slice(-252));
@@ -593,7 +594,50 @@ function computeForecast(fs) {
     };
   }
 
-  return { momentum, policy, path, market };
+  // 日経225センチメント: 構成は米国版と同系。日経VI・日本の信用スプレッドは
+  // 無料日次ソースが無いため、実現ボラ+米VIXと円レート（急円高=リスクオフ）で代替。
+  let nikkei = null;
+  const nk = levels("NIKKEI225");
+  const jpy = levels("USDJPY");
+  if (nk.length >= 252 && vix != null) {
+    const price = nk[nk.length - 1];
+    const ma125 = nk.slice(-125).reduce((a, b) => a + b, 0) / 125;
+    const hi52 = Math.max(...nk.slice(-252));
+    const momPct = (price / ma125 - 1) * 100;
+    const ddPct = (price / hi52 - 1) * 100;
+    const rets = [];
+    for (let i = nk.length - 20; i < nk.length; i++) rets.push(Math.log(nk[i] / nk[i - 1]));
+    const mean = rets.reduce((a, b) => a + b, 0) / rets.length;
+    const rv = Math.sqrt(rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1))
+             * Math.sqrt(250) * 100;  // 20日実現ボラ（年率%）
+    const fxPct = jpy.length >= 26
+      ? (jpy[jpy.length - 1] / jpy[jpy.length - 26] - 1) * 100 : null;  // 25日円変化率
+    const c = {
+      momentum: clamp1(momPct / 10),        // 日経は高ボラのため±10%でフルスケール
+      drawdown: clamp1(1 + ddPct / 12),     // 高値=+1、−12%=0、−24%=−1
+      rvol: clamp1((20 - rv) / 8),          // 実現ボラ12%=+1、20%=0、28%=−1
+      vix: clamp1((22 - vix) / 10),
+    };
+    // 円成分（+円安=追い風）。取得不可時は米HY OASで代替
+    let fifth = null, fxFallback = false;
+    if (fxPct != null) {
+      c.yen = clamp1(fxPct / 4);
+      fifth = c.yen;
+    } else if (hyoas != null) {
+      c.credit = clamp1((4.5 - hyoas) / 2);
+      fifth = c.credit;
+      fxFallback = true;
+    }
+    if (fifth != null) {
+      nikkei = {
+        score: 100 * (0.3 * c.momentum + 0.2 * c.drawdown + 0.15 * c.rvol + 0.15 * c.vix + 0.2 * fifth),
+        c, price, momPct, ddPct, rv, vix, fxPct, hyoas, fxFallback,
+        jpyLatest: jpy.length ? jpy[jpy.length - 1] : null,
+      };
+    }
+  }
+
+  return { momentum, policy, path, market, nikkei };
 }
 
 /* ── 半円ゲージ（SVG） ──
@@ -637,7 +681,8 @@ const forecastEl = document.getElementById("forecast");
 const FX_CARDS = [
   ["fx-policy",   "金融政策バイアス（タカ・ハト）", "合成スコア", true],
   ["fx-momentum", "インフレ・モメンタム",           "3ヶ月年率 − 前年比", true],
-  ["fx-market",   "株式市場センチメント",           "モメンタム ↔ 急落恐怖", true],
+  ["fx-market",   "米国株センチメント（S&P500）",   "モメンタム ↔ 急落恐怖", true],
+  ["fx-nikkei",   "日経225センチメント",            "モメンタム ↔ 急落恐怖", true],
   ["fx-path",     "市場が織り込む金利パス",         "国債利回り逆算", false],
   ["fx-nc-cpi",   "次回コアCPI予想",                "CLEVELAND FED", false],
   ["fx-nc-pce",   "次回コアPCE予想",                "CLEVELAND FED", false],
@@ -721,8 +766,8 @@ function renderMomentumCard(m) {
     <div class="card-meta">コアCPI・コアPCEの「3ヶ月年率 − 前年比」の平均</div>`);
 }
 
-function renderMarketCard(mk) {
-  if (!mk) return fxError("fx-market");
+function renderSentimentCard(id, mk, meta) {
+  if (!mk) return fxError(id);
   const s = mk.score;
   const [label, cls] =
       s < -60 ? ["急落恐怖（パニック）", "bad"]
@@ -730,13 +775,13 @@ function renderMarketCard(mk) {
     : s <= 20 ? ["中立", ""]
     : s <= 60 ? ["リスクオン", "good"]
     :           ["強いモメンタム", "good"];
-  fxCardBody("fx-market", `
+  fxCardBody(id, `
     ${gaugeSVG(s, 100, true)}
     <div class="card-value-row">
       <span class="card-value">${s >= 0 ? "+" : ""}${Math.round(s)}</span>
     </div>
     <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
-    <div class="card-meta">S&amp;P500トレンド 50% + VIX 30% + 信用スプレッド 20%</div>`);
+    <div class="card-meta">${meta}</div>`);
 }
 
 function renderPathCard(p) {
@@ -844,12 +889,12 @@ function renderBreakdown(fx, nc) {
       <tbody>${row("コアCPI", m.cpi)}${row("コアPCE", m.pce)}</tbody>
     </table>`;
   }
+  const mrow = (name, val, comp, w) =>
+    `<tr><td>${name}</td><td>${val}</td><td>${w}%</td><td>${pp(comp * w, 0)}</td></tr>`;
   const mk = fx.market;
   if (mk) {
-    const mrow = (name, val, comp, w) =>
-      `<tr><td>${name}</td><td>${val}</td><td>${w}%</td><td>${pp(comp * w, 0)}</td></tr>`;
     html += `
-    <h3>株式市場センチメントの内訳</h3>
+    <h3>米国株センチメントの内訳</h3>
     <table class="bd-table">
       <thead><tr><th>成分</th><th>値</th><th>重み</th><th>寄与</th></tr></thead>
       <tbody>
@@ -861,6 +906,27 @@ function renderBreakdown(fx, nc) {
       </tbody>
     </table>`;
   }
+  const nkm = fx.nikkei;
+  if (nkm) {
+    const fifthRow = !nkm.fxFallback
+      ? mrow(`円レート（ドル円 ${nkm.jpyLatest != null ? nkm.jpyLatest.toFixed(1) : "—"} の25日変化率・円安=+）`,
+             `${pp(nkm.fxPct)}%`, nkm.c.yen, 20)
+      : mrow("信用ストレス（米HY OAS・円データ取得不可のため代替）",
+             `${nkm.hyoas.toFixed(2)}%`, nkm.c.credit, 20);
+    html += `
+    <h3>日経225センチメントの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>成分</th><th>値</th><th>重み</th><th>寄与</th></tr></thead>
+      <tbody>
+        ${mrow(`価格モメンタム（日経225 ${Math.round(nkm.price).toLocaleString()} の125日線乖離）`, `${pp(nkm.momPct)}%`, nkm.c.momentum, 30)}
+        ${mrow("52週高値からの下落率", `${pp(nkm.ddPct)}%`, nkm.c.drawdown, 20)}
+        ${mrow("実現ボラティリティ（20日・年率）", `${nkm.rv.toFixed(1)}%`, nkm.c.rvol, 15)}
+        ${mrow("恐怖指数（米VIX）", nkm.vix.toFixed(1), nkm.c.vix, 15)}
+        ${fifthRow}
+        <tr><td>合成スコア</td><td></td><td></td><td><strong>${pp(nkm.score, 0)}</strong></td></tr>
+      </tbody>
+    </table>`;
+  }
   html += `
   <div class="bd-note">
     計算方法: テイラールールは i* = π + r* + 0.5(π−2) + (u*−u)。π=コアPCE前年比、
@@ -869,7 +935,9 @@ function renderBreakdown(fx, nc) {
     Δ ≈ 2×(1年債 − FF金利)。タームプレミアムを含む概算であり、FF金利先物ほど正確ではない。
     次回発表予想の出典: ${nc && nc.source ? nc.source : "Federal Reserve Bank of Cleveland, Inflation Nowcasting"}。
     株式市場センチメントは各成分を固定アンカーで±1に正規化した加重平均
-    （125日線乖離±8%、下落率0〜−20%、VIX 12〜32、ハイイールドOAS 2.5〜6.5%でフルスケール）。
+    （米国: 125日線乖離±8%、下落率0〜−20%、VIX 12〜32、ハイイールドOAS 2.5〜6.5%でフルスケール。
+    日経: 高ボラのため乖離±10%・下落率0〜−24%に拡大、日経VIの無料ソースが無いため
+    実現ボラ12〜28%+米VIXで代替、円は25日変化率±4%・急円高=リスクオフ。出典: ECB参照レート）。
     +100=モメンタム相場、−100=急落恐怖。
     いずれも機械的な参考値であり、投資判断はご自身で。
   </div>`;
@@ -894,11 +962,19 @@ async function loadForecast(bundle, force) {
       const res = await fetch("/api/nowcast" + (force ? "?refresh=1" : ""));
       if (res.ok) nc = await res.json();
     } catch { /* フォールバック表示 */ }
+    try {
+      const res = await fetch("/api/usdjpy" + (force ? "?refresh=1" : ""));
+      if (res.ok) fs.USDJPY = await res.json();
+    } catch { /* 円成分はHY OASで代替 */ }
   }
   const fx = computeForecast(fs);
   renderPolicyCard(fx.policy);
   renderMomentumCard(fx.momentum);
-  renderMarketCard(fx.market);
+  renderSentimentCard("fx-market", fx.market,
+    "S&amp;P500トレンド 50% + VIX 30% + 信用スプレッド 20%");
+  renderSentimentCard("fx-nikkei", fx.nikkei,
+    "日経225トレンド 50% + ボラ 30%（実現+米VIX） + " +
+    (fx.nikkei && fx.nikkei.fxFallback ? "信用スプレッド 20%（円データ代替）" : "円レート 20%"));
   renderPathCard(fx.path);
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");

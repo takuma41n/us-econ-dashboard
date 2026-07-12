@@ -43,7 +43,12 @@ FORECAST_SERIES = [
     ("SP500", "lin", 15),         # S&P500（125日MA・52週高値の計算に約14ヶ月必要）
     ("VIXCLS", "lin", 2),         # VIX
     ("BAMLH0A0HYM2", "lin", 2),   # ハイイールド債OAS（信用ストレス）
+    ("NIKKEI225", "lin", 15),     # 日経225（125日MA・52週高値・実現ボラ用）
 ]
+
+# ドル円（日経センチメントの円成分）。FREDのDEXJPUSは週次公表で約1週間
+# 遅れるため、ECB公式参照レートを日次で返す frankfurter.dev を使う。
+FRANKFURTER_URL = "https://api.frankfurter.dev/v1"
 
 # クリーブランド連銀インフレ・ナウキャスト（公開JSON・認証不要）
 NOWCAST_URLS = {
@@ -213,6 +218,21 @@ def fetch_nowcast():
     }
 
 
+def fetch_usdjpy():
+    """ドル円の直近約2ヶ月をFRED系列と同じ形で返す。失敗時は None。"""
+    start = (datetime.date.today() - datetime.timedelta(days=65)).isoformat()
+    req = urllib.request.Request(
+        f"{FRANKFURTER_URL}/{start}..?base=USD&symbols=JPY",
+        headers={"User-Agent": "econ-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rates = json.loads(resp.read().decode("utf-8")).get("rates", {})
+    obs = [{"date": d, "value": float(v["JPY"])}
+           for d, v in sorted(rates.items()) if "JPY" in v]
+    if not obs:
+        return None
+    return {"series_id": "USDJPY", "units": "lin", "observations": obs}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data.json")
@@ -250,6 +270,18 @@ def main():
         if n == 0:
             sys.exit(f"{sid} の観測値が0件 — 異常なので中断します")
         time.sleep(0.5)
+
+    # ドル円（失敗してもビルドは止めない。クライアントがHY OASにフォールバック）
+    try:
+        usdjpy = fetch_usdjpy()
+        if usdjpy:
+            bundle["forecast_series"]["USDJPY"] = usdjpy
+            print(f"  [forecast] USDJPY: {len(usdjpy['observations'])} obs "
+                  f"(ECB, latest {usdjpy['observations'][-1]['value']})")
+        else:
+            print("  [forecast] USDJPY: 取得0件（円成分はHY OASで代替表示）")
+    except Exception as e:
+        print(f"  [forecast] USDJPY: 取得失敗: {e}（円成分はHY OASで代替表示）")
 
     # クリーブランド連銀ナウキャスト（失敗してもビルドは止めない）
     try:
