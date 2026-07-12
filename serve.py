@@ -17,6 +17,8 @@ import urllib.request
 import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
+from fetch_data import fetch_nowcast
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
@@ -36,6 +38,12 @@ ALLOWED_SERIES = {
     "ICSA",            # 新規失業保険申請
     "ECIWAG",          # ECI賃金
     "CES0500000003",   # 平均時給
+    # 予測セクション用
+    "EFFR",            # 実効FF金利
+    "NROU",            # 自然失業率（CBO）
+    "DGS1",            # 1年債利回り
+    "DGS2",            # 2年債利回り
+    "EXPINF1YR",       # 1年期待インフレ
 }
 ALLOWED_UNITS = {"lin", "pc1", "chg"}
 
@@ -78,13 +86,17 @@ def fred_get(url, params):
 
 
 def fetch_fred(api_key, series_id, units, start):
-    data = fred_get(FRED_URL, {
+    params = {
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
         "units": units,
         "observation_start": start,
-    })
+    }
+    if series_id == "NROU":
+        # CBO推計は将来四半期の予測値も返すため、今日までに限定する
+        params["observation_end"] = time.strftime("%Y-%m-%d")
+    data = fred_get(FRED_URL, params)
     observations = [
         {"date": o["date"], "value": float(o["value"])}
         for o in data.get("observations", [])
@@ -154,6 +166,8 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/series":
             self.handle_series(urllib.parse.parse_qs(parsed.query))
+        elif parsed.path == "/api/nowcast":
+            self.handle_nowcast(urllib.parse.parse_qs(parsed.query))
         elif parsed.path == "/data.json":
             # ローカルでは常にライブAPIを使わせる（古い静的JSONの誤読防止）
             self.send_json(404, {"error": "not_found"})
@@ -162,6 +176,25 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
         else:
             super().do_GET()
+
+    def handle_nowcast(self, qs):
+        """クリーブランド連銀ナウキャストのプロキシ（先方はCORS非対応）。"""
+        force = (qs.get("refresh") or ["0"])[0] == "1"
+        cached = read_cache("nowcast", "cle")
+        if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
+            return self.send_json(200, cached)
+        try:
+            nowcast = fetch_nowcast()
+            if nowcast is None:
+                raise ValueError("parse failed")
+            nowcast["fetched_at"] = int(time.time())
+            write_cache("nowcast", "cle", nowcast)
+            return self.send_json(200, nowcast)
+        except Exception:
+            if cached:
+                cached["stale"] = True
+                return self.send_json(200, cached)
+            return self.send_json(502, {"error": "nowcast_unavailable"})
 
     def handle_series(self, qs):
         series_id = (qs.get("id") or [""])[0].upper()

@@ -160,6 +160,58 @@
   .card.loading .card-value { color: var(--text-muted); }
   .card .err { font-size: 12px; color: var(--bad); }
 
+  /* ── 予測セクション ── */
+  .card.static { cursor: default; }
+  .gauge-svg { width: 100%; max-width: 250px; margin: 2px auto 0; display: block; }
+  .gauge-center { align-items: center; text-align: center; }
+  .gauge-center .card-value-row { justify-content: center; }
+  .gauge-zone {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 650;
+    color: var(--text-secondary);
+  }
+  .gauge-zone .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-muted);
+    flex: none;
+  }
+  .gauge-zone .dot.good { background: var(--good); }
+  .gauge-zone .dot.bad  { background: var(--bad); }
+  .card-sub { font-size: 12px; color: var(--text-secondary); }
+
+  .breakdown {
+    margin-top: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 10px 16px;
+  }
+  .breakdown summary { cursor: pointer; font-weight: 600; color: var(--text-secondary); }
+  .breakdown h3 {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin: 14px 0 4px;
+  }
+  .bd-table { width: 100%; border-collapse: collapse; margin-top: 2px; }
+  .bd-table th, .bd-table td {
+    padding: 4px 8px;
+    border-top: 1px solid var(--grid);
+    text-align: right;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .bd-table tr > :first-child { text-align: left; width: 40%; white-space: normal; }
+  .bd-table thead th { border-top: none; color: var(--text-muted); font-size: 11px; }
+  .bd-note { margin-top: 12px; font-size: 11px; color: var(--text-muted); line-height: 1.7; }
+
   #tooltip {
     position: fixed;
     display: none;
@@ -196,11 +248,14 @@
 
 <div id="sections"></div>
 
+<div id="forecast"></div>
+
 <div id="tooltip"></div>
 
 <footer>
-  データ出典: FRED, Federal Reserve Bank of St. Louis。カードをクリックするとFREDの系列ページが開きます。<br>
-  色の意味: <span style="color:var(--good)">緑</span> = インフレ沈静化・雇用改善の方向 / <span style="color:var(--bad)">赤</span> = その逆。賃金指標はインフレ圧力の観点で色付けしています。
+  データ出典: FRED, Federal Reserve Bank of St. Louis ／ 次回発表予想は Federal Reserve Bank of Cleveland, Inflation Nowcasting。実績カードをクリックするとFREDの系列ページが開きます。<br>
+  色の意味: <span style="color:var(--good)">緑</span> = インフレ沈静化・雇用改善の方向 / <span style="color:var(--bad)">赤</span> = その逆。賃金指標はインフレ圧力の観点で色付けしています。<br>
+  「先読み・政策バイアス」は機械的に計算した参考値です（計算式は同セクションの「内訳と計算方法」参照）。投資助言ではありません。
 </footer>
 
 <script>
@@ -370,8 +425,11 @@ function drawSpark(svg, s, obs) {
 }
 
 /* ── カード更新 ── */
+const lastPayloads = {};   // 予測セクションが公開日等を再利用する
+
 function renderCard(s, payload) {
   const card = cards[s.id];
+  lastPayloads[s.id] = payload;
   card.classList.remove("loading");
   const obs = payload.observations;
   if (!obs || obs.length === 0) {
@@ -435,6 +493,349 @@ function renderError(s, err) {
   card.querySelector(".card-delta").innerHTML = `<span class="err">${msg}</span>`;
 }
 
+/* ══ 予測・政策バイアス ══════════════════════════════════
+ * 実績カードとは別に、FREDの追加系列とクリーブランド連銀ナウキャストから
+ * 「タカ/ハト」「インフレモメンタム」「金利パス」「次回発表予想」を導出する。
+ * 計算式と前提はページ下部「内訳と計算方法」に明記。
+ */
+const FORECAST_SERIES = [
+  { id: "PCEPILFE",  months: 30 },  // コアPCE指数水準
+  { id: "CPILFESL",  months: 30 },  // コアCPI指数水準
+  { id: "EFFR",      months: 3 },   // 実効FF金利
+  { id: "NROU",      months: 18 },  // 自然失業率（CBO）
+  { id: "DGS1",      months: 3 },   // 1年債利回り
+  { id: "DGS2",      months: 3 },   // 2年債利回り
+  { id: "EXPINF1YR", months: 6 },   // 1年期待インフレ
+];
+
+function monthsBackISO(n) {
+  const d = new Date();
+  d.setMonth(d.getMonth() - n);
+  return d.toISOString().slice(0, 10);
+}
+
+/* ── 導出計算 ── */
+function annualized(levels, back) {
+  // 指数水準の back ヶ月変化を年率換算（%）
+  return (Math.pow(levels[levels.length - 1] / levels[levels.length - 1 - back], 12 / back) - 1) * 100;
+}
+
+function computeForecast(fs) {
+  const levels = id => ((fs[id] && fs[id].observations) || []).map(o => o.value);
+  const lastVal = id => {
+    const obs = (fs[id] && fs[id].observations) || [];
+    return obs.length ? obs[obs.length - 1].value : null;
+  };
+  const momOf = L => L.length >= 13
+    ? { ann3: annualized(L, 3), ann6: annualized(L, 6), yoy: annualized(L, 12) }
+    : null;
+
+  const cpi = momOf(levels("CPILFESL"));
+  const pce = momOf(levels("PCEPILFE"));
+  const momentum = cpi && pce ? {
+    cpi, pce,
+    score: ((cpi.ann3 - cpi.yoy) + (pce.ann3 - pce.yoy)) / 2,  // pp
+    deflation: (cpi.ann3 + pce.ann3) / 2 < 0,
+  } : null;
+
+  const unObs = (lastPayloads.UNRATE || {}).observations || [];
+  const unrate = unObs.length ? unObs[unObs.length - 1].value : null;
+  const effr = lastVal("EFFR"), nrou = lastVal("NROU");
+  const dgs1 = lastVal("DGS1"), dgs2 = lastVal("DGS2");
+  const exp1 = lastVal("EXPINF1YR");
+  const pi = pce ? pce.yoy : null;  // コアPCE前年比をインフレ率とする
+
+  let policy = null;
+  if ([pi, unrate, effr, nrou, dgs2, exp1].every(v => v != null)) {
+    // テイラールール: i* = π + r*(0.5) + 0.5(π−2) + (u*−u)
+    const istar = pi + 0.5 + 0.5 * (pi - 2) + (nrou - unrate);
+    const taylorGap = istar - effr;        // +なら引き締め不足 = タカ圧力
+    const mkt = dgs2 - effr;               // +なら利上げ織り込み
+    const expGap = exp1 - 2;               // 期待インフレの2%超過
+    const raw = 0.4 * (taylorGap / 2) + 0.4 * (mkt / 1.5) + 0.2 * (expGap / 1);
+    policy = {
+      score: Math.max(-1, Math.min(1, raw)) * 100,
+      istar, taylorGap, mkt, expGap, pi, unrate, nrou, effr, exp1,
+    };
+  }
+
+  let path = null;
+  if (effr != null && dgs1 != null && dgs2 != null) {
+    // 線形パス仮定: 1年債利回り ≈ 今後1年の政策金利平均 → Δ ≈ 2×(DGS1−EFFR)
+    const delta1y = 2 * (dgs1 - effr) * 100;  // bp
+    path = { effr, dgs1, dgs2, delta1y, moves: Math.round(delta1y / 25),
+             spread2y: (dgs2 - effr) * 100 };
+  }
+
+  return { momentum, policy, path };
+}
+
+/* ── 半円ゲージ（SVG） ──
+ * 針の位置+ゾーンラベルが本体。色（緑=沈静化方向/赤=圧力方向）は補助。
+ */
+function gaugeSVG(score, domain) {
+  const W = 250, H = 128, CX = 125, CY = 112, R = 92;
+  const pt = (s, r) => {
+    const t = Math.max(-1, Math.min(1, s / domain));
+    const a = (1 - (t + 1) / 2) * Math.PI;
+    return [CX + r * Math.cos(a), CY - r * Math.sin(a)];
+  };
+  const arc = (s0, s1) => {
+    const [x0, y0] = pt(s0, R), [x1, y1] = pt(s1, R);
+    return `M ${x0.toFixed(1)} ${y0.toFixed(1)} A ${R} ${R} 0 0 1 ${x1.toFixed(1)} ${y1.toFixed(1)}`;
+  };
+  const zone = domain * 0.2, g = domain * 0.012;  // 中立域±20% / ゾーン間は地色の隙間
+  const [nx, ny] = pt(score, R - 15);
+  const [tx0, ty0] = pt(0, R - 5), [tx1, ty1] = pt(0, R + 5);
+  return `
+  <svg class="gauge-svg" viewBox="0 0 ${W} ${H}" role="img">
+    <path d="${arc(-domain, -zone - g)}" fill="none" stroke="var(--good)" stroke-opacity="0.3" stroke-width="10"/>
+    <path d="${arc(-zone + g, zone - g)}" fill="none" stroke="var(--grid)" stroke-width="10"/>
+    <path d="${arc(zone + g, domain)}" fill="none" stroke="var(--bad)" stroke-opacity="0.3" stroke-width="10"/>
+    <line x1="${tx0.toFixed(1)}" y1="${ty0.toFixed(1)}" x2="${tx1.toFixed(1)}" y2="${ty1.toFixed(1)}"
+          stroke="var(--text-muted)" stroke-width="1"/>
+    <line x1="${CX}" y1="${CY}" x2="${nx.toFixed(1)}" y2="${ny.toFixed(1)}"
+          stroke="var(--text-primary)" stroke-width="2" stroke-linecap="round"/>
+    <circle cx="${CX}" cy="${CY}" r="4.5" fill="var(--text-primary)"
+            stroke="var(--surface)" stroke-width="2"/>
+    <text x="${CX - R}" y="${H - 2}" font-size="10" fill="var(--text-muted)" text-anchor="middle">-${domain}</text>
+    <text x="${CX + R}" y="${H - 2}" font-size="10" fill="var(--text-muted)" text-anchor="middle">+${domain}</text>
+  </svg>`;
+}
+
+/* ── 予測セクションDOM ── */
+const forecastEl = document.getElementById("forecast");
+const FX_CARDS = [
+  ["fx-policy",   "金融政策バイアス（タカ・ハト）", "合成スコア", true],
+  ["fx-momentum", "インフレ・モメンタム",           "3ヶ月年率 − 前年比", true],
+  ["fx-path",     "市場が織り込む金利パス",         "国債利回り逆算", false],
+  ["fx-nc-cpi",   "次回コアCPI予想",                "CLEVELAND FED", false],
+  ["fx-nc-pce",   "次回コアPCE予想",                "CLEVELAND FED", false],
+];
+
+function buildForecastDOM() {
+  const sec = document.createElement("section");
+  sec.innerHTML = `<h2>先読み・政策バイアス</h2>`;
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const [id, label, sid, centered] of FX_CARDS) {
+    const card = document.createElement("div");
+    card.className = "card static loading" + (centered ? " gauge-center" : "");
+    card.id = id;
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="card-label">${label}</span>
+        <span class="card-sid">${sid}</span>
+      </div>
+      <div class="card-value-row">
+        <span class="card-value">—</span><span class="card-unit"></span>
+      </div>
+      <div class="card-meta">&nbsp;</div>`;
+    grid.appendChild(card);
+  }
+  sec.appendChild(grid);
+  const details = document.createElement("details");
+  details.className = "breakdown";
+  details.innerHTML = `<summary>内訳と計算方法</summary><div id="fx-breakdown-body"></div>`;
+  sec.appendChild(details);
+  forecastEl.appendChild(sec);
+}
+buildForecastDOM();
+
+function fxCardBody(id, html) {
+  const card = document.getElementById(id);
+  card.classList.remove("loading");
+  const head = card.querySelector(".card-head").outerHTML;
+  card.innerHTML = head + html;
+}
+
+function fxError(id, msg) {
+  fxCardBody(id, `<div class="card-delta"><span class="err">${msg || "取得エラー"}</span></div>`);
+}
+
+const pp = (v, d = 2) => `${v >= 0 ? "+" : ""}${v.toFixed(d)}`;
+
+function renderPolicyCard(p) {
+  if (!p) return fxError("fx-policy");
+  const [label, cls] =
+      p.score < -60 ? ["強いハト（利下げ圧力）", "good"]
+    : p.score < -20 ? ["ハト寄り（緩和方向）", "good"]
+    : p.score <= 20 ? ["中立", ""]
+    : p.score <= 60 ? ["タカ寄り（引き締め圧力）", "bad"]
+    :                 ["強いタカ（引き締め圧力）", "bad"];
+  fxCardBody("fx-policy", `
+    ${gaugeSVG(p.score, 100)}
+    <div class="card-value-row">
+      <span class="card-value">${p.score >= 0 ? "+" : ""}${Math.round(p.score)}</span>
+    </div>
+    <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-meta">テイラー準拠 40% + 2年債織り込み 40% + 期待インフレ 20%</div>`);
+}
+
+function renderMomentumCard(m) {
+  if (!m) return fxError("fx-momentum");
+  const s = m.score;
+  let [label, cls] =
+      s < -0.75 ? ["減速中（ディスインフレ）", "good"]
+    : s < -0.25 ? ["やや減速", "good"]
+    : s <= 0.25 ? ["横ばい", ""]
+    : s <= 0.75 ? ["やや加速", "bad"]
+    :             ["加速中", "bad"];
+  if (m.deflation) { label = "デフレ圏（物価下落）"; cls = "bad"; }
+  fxCardBody("fx-momentum", `
+    ${gaugeSVG(s, 2)}
+    <div class="card-value-row">
+      <span class="card-value">${pp(s)}</span><span class="card-unit">pp</span>
+    </div>
+    <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-meta">コアCPI・コアPCEの「3ヶ月年率 − 前年比」の平均</div>`);
+}
+
+function renderPathCard(p) {
+  if (!p) return fxError("fx-path");
+  const dir = p.delta1y > 12.5 ? "利上げ" : p.delta1y < -12.5 ? "利下げ" : "据え置き";
+  const moves = Math.abs(p.moves);
+  fxCardBody("fx-path", `
+    <div class="card-value-row">
+      <span class="card-value">${pp(p.delta1y, 0)}</span><span class="card-unit">bp</span>
+    </div>
+    <div class="card-meta">今後1年の政策金利変化の織り込み（概算）</div>
+    <div class="card-delta"><span class="dir">${dir}${moves ? ` 25bp×約${moves}回分` : ""}</span></div>
+    <div class="card-sub">FF金利 ${p.effr.toFixed(2)}% ・ 1年債 ${p.dgs1.toFixed(2)}% ・ 2年債 ${p.dgs2.toFixed(2)}%</div>`);
+}
+
+function nextPendingMonth(nc, key) {
+  // 実績がまだ無い最初の月 = 次に発表される分
+  if (!nc || !nc.months) return null;
+  for (const mo of nc.months) {
+    const v = mo[key];
+    if (v && v.yoy != null && v.actual_yoy == null && v.actual_mom == null) return mo;
+  }
+  return null;
+}
+
+function lastActualYoy(nc, key) {
+  if (!nc || !nc.months) return null;
+  for (let i = nc.months.length - 1; i >= 0; i--) {
+    const v = nc.months[i][key];
+    if (v && v.actual_yoy != null) return v.actual_yoy;
+  }
+  return null;
+}
+
+function renderNowcastCard(id, nc, coreKey, headKey, headName, mom, releaseSid) {
+  // ナウキャスト本体。取得不可なら自前モメンタムで簡易外挿にフォールバック。
+  const relParts = [];
+  const rel = (lastPayloads[releaseSid] || {}).release;
+  if (rel && rel.next_date) {
+    const days = daysUntil(rel.next_date);
+    relParts.push(`公開 ${fmtReleaseDate(rel.next_date)}（${days === 0 ? "本日" : `あと${days}日`}）`);
+  }
+  const pend = nextPendingMonth(nc, coreKey);
+  if (pend) {
+    const core = pend[coreKey], head = pend[headKey];
+    const prev = lastActualYoy(nc, coreKey);
+    const month = Number(pend.month.slice(5));
+    let delta = "";
+    if (prev != null) {
+      const diff = core.yoy - prev;
+      const improving = diff < 0;
+      delta = Math.abs(diff) < 0.005
+        ? `<span class="dir">→ 変わらず</span>　前回実績 ${prev.toFixed(2)}%`
+        : `<span class="dir ${improving ? "good" : "bad"}">${diff > 0 ? "▲" : "▼"} ${Math.abs(diff).toFixed(2)}pt</span>　前回実績 ${prev.toFixed(2)}%`;
+    }
+    fxCardBody(id, `
+      <div class="card-value-row">
+        <span class="card-value">${core.yoy.toFixed(2)}</span><span class="card-unit">%</span>
+      </div>
+      <div class="card-meta">${month}月分・前年比の予測値</div>
+      <div class="card-delta">${delta || "&nbsp;"}</div>
+      <div class="card-sub">前月比 ${pp(core.mom)}%${head && head.yoy != null ? ` ・ 総合${headName} ${head.yoy.toFixed(2)}%` : ""}</div>
+      <div class="card-release">ナウキャスト ${fmtReleaseDate(nc.as_of)}時点${relParts.length ? " ・ " + relParts.join("") : ""}</div>`);
+  } else if (mom) {
+    const m = coreKey === "cpi_core" ? mom.cpi : mom.pce;
+    fxCardBody(id, `
+      <div class="card-value-row">
+        <span class="card-value">${m.ann3.toFixed(2)}</span><span class="card-unit">%</span>
+      </div>
+      <div class="card-meta">直近3ヶ月年率（簡易外挿）</div>
+      <div class="card-delta"><span class="dir">前年比 ${m.yoy.toFixed(2)}% との差 ${pp(m.ann3 - m.yoy)}pp</span></div>
+      <div class="card-release">ナウキャスト取得不可のためモメンタムで代替${relParts.length ? " ・ " + relParts.join("") : ""}</div>`);
+  } else {
+    fxError(id);
+  }
+}
+
+function renderBreakdown(fx, nc) {
+  const body = document.getElementById("fx-breakdown-body");
+  const p = fx.policy, m = fx.momentum;
+  let html = "";
+  if (p) {
+    const c1 = 0.4 * (p.taylorGap / 2) * 100, c2 = 0.4 * (p.mkt / 1.5) * 100, c3 = 0.2 * (p.expGap / 1) * 100;
+    html += `
+    <h3>金融政策バイアスの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>成分</th><th>値</th><th>重み</th><th>寄与</th></tr></thead>
+      <tbody>
+        <tr><td>テイラールール差（あるべき金利 ${p.istar.toFixed(2)}% − FF金利 ${p.effr.toFixed(2)}%）</td>
+            <td>${pp(p.taylorGap)}pp</td><td>40%</td><td>${pp(c1, 0)}</td></tr>
+        <tr><td>市場織り込み（2年債 − FF金利）</td>
+            <td>${pp(p.mkt)}pp</td><td>40%</td><td>${pp(c2, 0)}</td></tr>
+        <tr><td>期待インフレ超過（1年期待 ${p.exp1.toFixed(2)}% − 目標2%）</td>
+            <td>${pp(p.expGap)}pp</td><td>20%</td><td>${pp(c3, 0)}</td></tr>
+        <tr><td>合成スコア（±100にクランプ）</td><td></td><td></td><td><strong>${pp(p.score, 0)}</strong></td></tr>
+      </tbody>
+    </table>`;
+  }
+  if (m) {
+    const row = (name, x) => `<tr><td>${name}</td><td>${x.ann3.toFixed(2)}%</td><td>${x.ann6.toFixed(2)}%</td><td>${x.yoy.toFixed(2)}%</td><td>${pp(x.ann3 - x.yoy)}pp</td></tr>`;
+    html += `
+    <h3>インフレ・モメンタムの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>指標</th><th>3ヶ月年率</th><th>6ヶ月年率</th><th>前年比</th><th>3m − 前年比</th></tr></thead>
+      <tbody>${row("コアCPI", m.cpi)}${row("コアPCE", m.pce)}</tbody>
+    </table>`;
+  }
+  html += `
+  <div class="bd-note">
+    計算方法: テイラールールは i* = π + r* + 0.5(π−2) + (u*−u)。π=コアPCE前年比、
+    r*=0.5%（固定の仮定）、u*=CBO自然失業率（NROU）、u=失業率。
+    金利パスは「1年債利回り ≈ 今後1年の政策金利の平均」という線形パス近似で
+    Δ ≈ 2×(1年債 − FF金利)。タームプレミアムを含む概算であり、FF金利先物ほど正確ではない。
+    次回発表予想の出典: ${nc && nc.source ? nc.source : "Federal Reserve Bank of Cleveland, Inflation Nowcasting"}。
+    いずれも機械的な参考値であり、投資判断はご自身で。
+  </div>`;
+  body.innerHTML = html;
+}
+
+async function loadForecast(bundle, force) {
+  let fs, nc = null;
+  if (bundle) {
+    fs = bundle.forecast_series || {};
+    nc = bundle.nowcast || null;
+  } else {
+    fs = {};
+    await Promise.all(FORECAST_SERIES.map(async (d) => {
+      try {
+        const res = await fetch(`/api/series?id=${d.id}&units=lin&start=${monthsBackISO(d.months)}`
+                              + (force ? "&refresh=1" : ""));
+        if (res.ok) fs[d.id] = await res.json();
+      } catch { /* 個別失敗はカード側で表示 */ }
+    }));
+    try {
+      const res = await fetch("/api/nowcast" + (force ? "?refresh=1" : ""));
+      if (res.ok) nc = await res.json();
+    } catch { /* フォールバック表示 */ }
+  }
+  const fx = computeForecast(fs);
+  renderPolicyCard(fx.policy);
+  renderMomentumCard(fx.momentum);
+  renderPathCard(fx.path);
+  renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
+  renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
+  renderBreakdown(fx, nc);
+}
+
 /* ── データ取得 ──
  * GitHub Pages では Actions が生成した静的 data.json を読む。
  * ローカル(serve.py)には data.json が無いので /api のライブ取得になる。
@@ -465,6 +866,7 @@ async function loadAll(force) {
       if (payload) renderCard(s, payload);
       else renderError(s, "missing");
     }
+    await loadForecast(bundle, force);
     document.getElementById("updated").textContent =
       "データ更新: " + new Date(bundle.generated_at)
         .toLocaleString("ja-JP", { dateStyle: "short", timeStyle: "short" });
@@ -491,6 +893,8 @@ async function loadAll(force) {
       renderError(s, "network");
     }
   }));
+
+  await loadForecast(null, force);
 
   if (noKey || badKey) {
     banner.innerHTML = `
