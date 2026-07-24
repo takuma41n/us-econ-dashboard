@@ -253,7 +253,7 @@
 <div id="tooltip"></div>
 
 <footer>
-  データ出典: FRED, Federal Reserve Bank of St. Louis ／ 次回発表予想は Federal Reserve Bank of Cleveland, Inflation Nowcasting。実績カードをクリックするとFREDの系列ページが開きます。<br>
+  データ出典: FRED, Federal Reserve Bank of St. Louis ／ 次回発表予想は Federal Reserve Bank of Cleveland, Inflation Nowcasting ／ FF金利先物は CME 30-Day Fed Funds futures（Yahoo Finance経由・遅延データ）。実績カードをクリックするとFREDの系列ページが開きます。<br>
   色の意味: <span style="color:var(--good)">緑</span> = インフレ沈静化・雇用改善の方向 / <span style="color:var(--bad)">赤</span> = その逆。賃金指標はインフレ圧力の観点で色付けしています。<br>
   「先読み・政策バイアス」は機械的に計算した参考値です（計算式は同セクションの「内訳と計算方法」参照）。投資助言ではありません。
 </footer>
@@ -301,7 +301,8 @@ function toDisplay(s, v) {
   const scaled = s.fmt === "man10" ? v / 10       // PAYEMS: 千人 → 万人
                : s.fmt === "man"   ? v / 10000    // ICSA: 件 → 万件
                : v;
-  return Math.round(scaled * 10) / 10;
+  const p = 10 ** (s.dec ?? 1);
+  return Math.round(scaled * p) / p;
 }
 function displayUnit(s) {
   return s.fmt === "man10" ? "万人" : s.fmt === "man" ? "万件" : "%";
@@ -310,7 +311,7 @@ function deltaUnit(s) {
   return s.fmt === "pct" ? "pt" : displayUnit(s);
 }
 function fmtValue(s, v) {
-  return [toDisplay(s, v).toFixed(1), displayUnit(s)];
+  return [toDisplay(s, v).toFixed(s.dec ?? 1), displayUnit(s)];
 }
 function fmtDate(s, iso) {
   const [y, m, d] = iso.split("-").map(Number);
@@ -494,8 +495,9 @@ function renderError(s, err) {
 }
 
 /* ══ 予測・政策バイアス ══════════════════════════════════
- * 実績カードとは別に、FREDの追加系列とクリーブランド連銀ナウキャストから
- * 「タカ/ハト」「インフレモメンタム」「金利パス」「次回発表予想」を導出する。
+ * 実績カードとは別に、FREDの追加系列・クリーブランド連銀ナウキャスト・
+ * FF金利先物（Yahoo Finance経由）から「タカ/ハト」「インフレモメンタム」
+ * 「金利パス（国債逆算・FF先物）」「次回発表予想」を導出する。
  * 計算式と前提はページ下部「内訳と計算方法」に明記。
  */
 const FORECAST_SERIES = [
@@ -510,6 +512,15 @@ const FORECAST_SERIES = [
   { id: "VIXCLS",       months: 2 },   // VIX
   { id: "BAMLH0A0HYM2", months: 2 },   // ハイイールド債OAS
   { id: "NIKKEI225",    months: 15 },  // 日経225（125日MA・52週高値・実現ボラ用）
+];
+
+/* FOMC決定日（会合2日目）。出典: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+ * 静的登録のため、毎年翌年分の公表後にここへ追記が必要（2027年分は暫定日程）。 */
+const FOMC_DECISIONS = [
+  "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+  "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+  "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-09",
+  "2027-07-28", "2027-09-15", "2027-10-27", "2027-12-08",
 ];
 
 function monthsBackISO(n) {
@@ -640,6 +651,65 @@ function computeForecast(fs) {
   return { momentum, policy, path, market, nikkei };
 }
 
+/* ── FF金利先物からの織り込みパス ──
+ * ZQ先物は「当該月のEFFR日次平均」で決済されるため、含意金利=100−価格。
+ * 会合のない月の含意金利は、その時点の政策金利の織り込みそのものになる。
+ */
+function addMonths(ym, k) {
+  let y = Number(ym.slice(0, 4)), m = Number(ym.slice(5, 7)) + k;
+  while (m > 12) { y++; m -= 12; }
+  return `${y}-${String(m).padStart(2, "0")}`;
+}
+
+function computeFFPath(ff, fs) {
+  if (!ff || !(ff.contracts || []).length) return null;
+  const effrObs = ((fs.EFFR || {}).observations) || [];
+  const effr = effrObs.length ? effrObs[effrObs.length - 1].value : null;
+  if (effr == null) return null;
+
+  const cs = [...ff.contracts].sort((a, b) => (a.month < b.month ? -1 : 1));
+  const byMonth = {};
+  for (const c of cs) byMonth[c.month] = c;
+  const delta12m = (cs[cs.length - 1].implied - effr) * 100;  // bp
+  const points = cs.map(c => ({ date: c.month + "-01", value: c.implied }));
+
+  // 次回FOMCの変更確率: r_post = 会合後最初の「会合なし月」の含意金利
+  const hasMeeting = ym => FOMC_DECISIONS.some(d => d.startsWith(ym));
+  const today = new Date().toISOString().slice(0, 10);
+  const dec = FOMC_DECISIONS.find(d => d >= today) || null;
+  let next = null;
+  if (dec) {
+    const meetingMonth = dec.slice(0, 7);
+    let free = null;
+    for (let k = 1; k <= 2; k++) {
+      const ym = addMonths(meetingMonth, k);
+      if (!hasMeeting(ym)) { free = ym; break; }
+    }
+    let rPost = null;
+    if (free && byMonth[free]) {
+      rPost = byMonth[free].implied;
+    } else if (byMonth[meetingMonth]) {
+      // フォールバック: 会合月の限月（月平均）から日数按分で解く。
+      // implied(M) = (d×r_pre + (N−d)×r_post)/N。月末会合は分母が小さく
+      // ノイズを増幅するため放棄する。
+      const d = Number(dec.slice(8, 10));
+      const N = new Date(Number(dec.slice(0, 4)), Number(dec.slice(5, 7)), 0).getDate();
+      if (N - d >= 5)
+        rPost = (N * byMonth[meetingMonth].implied - d * effr) / (N - d);
+    }
+    if (rPost != null) {
+      const n = (rPost - effr) / 0.25;
+      const k = Math.floor(n + 1e-9);
+      const frac = n - k;
+      const scenarios = [{ moves: k, prob: 1 - frac }, { moves: k + 1, prob: frac }]
+        .filter(s => s.prob >= 0.005);
+      next = { date: dec, rPost, diffBp: (rPost - effr) * 100, scenarios };
+    }
+  }
+  return { asOf: ff.as_of, stale: !!ff.stale, contracts: cs, points,
+           effr, delta12m, moves: delta12m / 25, next };
+}
+
 /* ── 半円ゲージ（SVG） ──
  * 針の位置+ゾーンラベルが本体。色（緑=沈静化方向/赤=圧力方向）は補助。
  * flip=true で緑/赤を左右反転（右がプラス方向で良い意味のゲージ用）。
@@ -684,6 +754,7 @@ const FX_CARDS = [
   ["fx-market",   "米国株センチメント（S&P500）",   "モメンタム ↔ 急落恐怖", true],
   ["fx-nikkei",   "日経225センチメント",            "モメンタム ↔ 急落恐怖", true],
   ["fx-path",     "市場が織り込む金利パス",         "国債利回り逆算", false],
+  ["fx-ffpath",   "FF金利先物の織り込みパス",       "CME FF先物", false],
   ["fx-nc-cpi",   "次回コアCPI予想",                "CLEVELAND FED", false],
   ["fx-nc-pce",   "次回コアPCE予想",                "CLEVELAND FED", false],
 ];
@@ -797,6 +868,31 @@ function renderPathCard(p) {
     <div class="card-sub">FF金利 ${p.effr.toFixed(2)}% ・ 1年債 ${p.dgs1.toFixed(2)}% ・ 2年債 ${p.dgs2.toFixed(2)}%</div>`);
 }
 
+/* drawSpark 用の擬似シリーズ設定（月次・%表示・小数2桁） */
+const FF_SPARK = { freq: "m", fmt: "pct", dec: 2 };
+
+function renderFFPathCard(f) {
+  if (!f) return fxError("fx-ffpath");
+  const dir = f.delta12m > 12.5 ? "利上げ" : f.delta12m < -12.5 ? "利下げ" : "据え置き";
+  const moves = Math.abs(Math.round(f.moves));
+  const scenLabel = m => m === 0 ? "据え置き"
+      : `${m > 0 ? "+" : "−"}${Math.abs(m) * 25}bp${m > 0 ? "利上げ" : "利下げ"}`;
+  const nextLine = f.next
+    ? `次回FOMC ${fmtReleaseDate(f.next.date)}: `
+      + f.next.scenarios.map(s => `${scenLabel(s.moves)} ${Math.round(s.prob * 100)}%`).join(" / ")
+    : "次回FOMC日程が未登録です";
+  fxCardBody("fx-ffpath", `
+    <div class="card-value-row">
+      <span class="card-value">${pp(f.delta12m, 0)}</span><span class="card-unit">bp</span>
+    </div>
+    <div class="card-meta">今後12ヶ月の政策金利変化の織り込み（FF先物の含意金利）</div>
+    <svg class="spark" preserveAspectRatio="none"></svg>
+    <div class="card-delta"><span class="dir">${dir}${moves ? ` 25bp×約${moves}回分` : ""}</span></div>
+    <div class="card-sub">${nextLine}</div>
+    <div class="card-release">先物価格 ${fmtReleaseDate(f.asOf)}時点${f.stale ? "（キャッシュ）" : ""} ・ FF金利 ${f.effr.toFixed(2)}%</div>`);
+  drawSpark(document.querySelector("#fx-ffpath .spark"), FF_SPARK, f.points);
+}
+
 function nextPendingMonth(nc, key) {
   // 実績がまだ無い最初の月 = 次に発表される分
   if (!nc || !nc.months) return null;
@@ -859,7 +955,7 @@ function renderNowcastCard(id, nc, coreKey, headKey, headName, mom, releaseSid) 
   }
 }
 
-function renderBreakdown(fx, nc) {
+function renderBreakdown(fx, nc, ffp) {
   const body = document.getElementById("fx-breakdown-body");
   const p = fx.policy, m = fx.momentum;
   let html = "";
@@ -927,12 +1023,30 @@ function renderBreakdown(fx, nc) {
       </tbody>
     </table>`;
   }
+  if (ffp) {
+    const mLabel = ym => { const [y, mo] = ym.split("-").map(Number); return `${y}年${mo}月`; };
+    html += `
+    <h3>FF金利先物の織り込みパス（限月別）</h3>
+    <table class="bd-table">
+      <thead><tr><th>限月</th><th>先物価格</th><th>含意金利（100−価格）</th></tr></thead>
+      <tbody>${ffp.contracts.map(c =>
+        `<tr><td>${mLabel(c.month)}（${c.symbol.replace(".CBT", "")}）</td>
+             <td>${c.price.toFixed(3)}</td><td>${c.implied.toFixed(3)}%</td></tr>`).join("")}
+      </tbody>
+    </table>`;
+  }
   html += `
   <div class="bd-note">
     計算方法: テイラールールは i* = π + r* + 0.5(π−2) + (u*−u)。π=コアPCE前年比、
     r*=0.5%（固定の仮定）、u*=CBO自然失業率（NROU）、u=失業率。
     金利パスは「1年債利回り ≈ 今後1年の政策金利の平均」という線形パス近似で
     Δ ≈ 2×(1年債 − FF金利)。タームプレミアムを含む概算であり、FF金利先物ほど正確ではない。
+    FF先物価格そのものからの織り込みは「FF金利先物の織り込みパス」カードに表示
+    （ZQ先物は当該月のEFFR日次平均で決済されるため含意金利=100−価格。次回会合の確率は
+    現在のFF金利と会合後最初の会合なし月の含意金利の差を25bp刻みの2シナリオに配分）。
+    先物価格はCME 30日FF先物のYahoo Finance遅延データで、本家CME FedWatch
+    （OIS・全会合ツリー計算）とは前提が異なるため数値がずれることがある。
+    FOMC日程は2027年分まで静的登録（毎年更新が必要）。
     次回発表予想の出典: ${nc && nc.source ? nc.source : "Federal Reserve Bank of Cleveland, Inflation Nowcasting"}。
     株式市場センチメントは各成分を固定アンカーで±1に正規化した加重平均
     （米国: 125日線乖離±8%、下落率0〜−20%、VIX 12〜32、ハイイールドOAS 2.5〜6.5%でフルスケール。
@@ -945,10 +1059,11 @@ function renderBreakdown(fx, nc) {
 }
 
 async function loadForecast(bundle, force) {
-  let fs, nc = null;
+  let fs, nc = null, ff = null;
   if (bundle) {
     fs = bundle.forecast_series || {};
     nc = bundle.nowcast || null;
+    ff = bundle.ff_futures || null;
   } else {
     fs = {};
     await Promise.all(FORECAST_SERIES.map(async (d) => {
@@ -966,8 +1081,13 @@ async function loadForecast(bundle, force) {
       const res = await fetch("/api/usdjpy" + (force ? "?refresh=1" : ""));
       if (res.ok) fs.USDJPY = await res.json();
     } catch { /* 円成分はHY OASで代替 */ }
+    try {
+      const res = await fetch("/api/fffutures" + (force ? "?refresh=1" : ""));
+      if (res.ok) ff = await res.json();
+    } catch { /* カードは縮退表示 */ }
   }
   const fx = computeForecast(fs);
+  const ffp = computeFFPath(ff, fs);
   renderPolicyCard(fx.policy);
   renderMomentumCard(fx.momentum);
   renderSentimentCard("fx-market", fx.market,
@@ -976,9 +1096,10 @@ async function loadForecast(bundle, force) {
     "日経225トレンド 50% + ボラ 30%（実現+米VIX） + " +
     (fx.nikkei && fx.nikkei.fxFallback ? "信用スプレッド 20%（円データ代替）" : "円レート 20%"));
   renderPathCard(fx.path);
+  renderFFPathCard(ffp);
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
-  renderBreakdown(fx, nc);
+  renderBreakdown(fx, nc, ffp);
 }
 
 /* ── データ取得 ──

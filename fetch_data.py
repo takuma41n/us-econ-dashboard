@@ -62,6 +62,13 @@ NOWCAST_MEASURES = {
     "Core PCE Inflation": "pce_core",
 }
 
+# CME 30日FF金利先物（ZQ）。CME公式APIはボット対策で自動取得不可のため、
+# Yahoo Finance のチャートAPI（無認証・遅延データ）から限月ごとに取得する。
+# 決済価格 = 100 −（当該月のEFFR日次平均）なので、含意金利 = 100 − 価格。
+YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
+                   "{symbol}?range=5d&interval=1d")
+FF_MONTH_CODES = "FGHJKMNQUVXZ"  # 限月コード: F=1月 … Z=12月
+
 
 def load_api_key():
     key = os.environ.get("FRED_API_KEY", "").strip()
@@ -233,9 +240,59 @@ def fetch_usdjpy():
     return {"series_id": "USDJPY", "units": "lin", "observations": obs}
 
 
+def _ff_symbols(n=13):
+    """当月から n ヶ月分の (月 "YYYY-MM", Yahooシンボル) を返す。年またぎ対応。"""
+    d = datetime.date.today()
+    y, m = d.year, d.month
+    out = []
+    for _ in range(n):
+        out.append((f"{y:04d}-{m:02d}", f"ZQ{FF_MONTH_CODES[m - 1]}{y % 100:02d}.CBT"))
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return out
+
+
+def fetch_ff_futures():
+    """FF金利先物の含意金利パス（当月から13限月）を取得する。
+
+    返り値: {"as_of": "YYYY-MM-DD", "source": ...,
+             "contracts": [{"month", "symbol", "price", "implied"}]}
+    取得できた限月が6未満なら None（呼び出し側でフォールバック）。
+    """
+    contracts, latest_ts = [], 0
+    for month, symbol in _ff_symbols():
+        try:
+            req = urllib.request.Request(
+                YAHOO_CHART_URL.format(symbol=symbol),
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                         "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                meta = json.loads(resp.read())["chart"]["result"][0]["meta"]
+            price = meta.get("regularMarketPrice")
+            # FF金利が0〜15%相当の範囲外なら異常値としてスキップ
+            if isinstance(price, (int, float)) and 85 < price < 100.5:
+                latest_ts = max(latest_ts, meta.get("regularMarketTime") or 0)
+                contracts.append({"month": month, "symbol": symbol,
+                                  "price": round(float(price), 4),
+                                  "implied": round(100 - float(price), 3)})
+        except Exception:
+            pass  # 遠い限月は無出来のことがあるため、限月単位の欠落は許容
+        time.sleep(0.3)
+    if len(contracts) < 6:
+        return None
+    as_of = (datetime.datetime.fromtimestamp(latest_ts, datetime.timezone.utc)
+             .date().isoformat()) if latest_ts else datetime.date.today().isoformat()
+    return {"as_of": as_of,
+            "source": "CME 30-Day Federal Funds Futures (Yahoo Finance, 遅延データ)",
+            "contracts": contracts}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data.json")
+    ap.add_argument("--prev", default=None,
+                    help="前回の data.json。取得失敗した外部ソースの縮退用")
     args = ap.parse_args()
 
     api_key = load_api_key()
@@ -294,6 +351,27 @@ def main():
     except Exception as e:
         bundle["nowcast"] = None
         print(f"  [nowcast] 取得失敗: {e}（フォールバック表示になります）")
+
+    # FF金利先物（失敗してもビルドは止めない。前回バンドルがあれば引き継ぐ）
+    try:
+        bundle["ff_futures"] = fetch_ff_futures()
+    except Exception:
+        bundle["ff_futures"] = None
+    if bundle["ff_futures"]:
+        print(f"  [ff_futures] {len(bundle['ff_futures']['contracts'])} 限月, "
+              f"as of {bundle['ff_futures']['as_of']}")
+    else:
+        if args.prev:
+            try:
+                with open(args.prev, encoding="utf-8") as f:
+                    prev_ff = json.load(f).get("ff_futures")
+                if prev_ff:
+                    prev_ff["stale"] = True  # as_of は前回のまま → 画面で古さが分かる
+                    bundle["ff_futures"] = prev_ff
+            except (OSError, json.JSONDecodeError):
+                pass
+        state = "前回分を引き継ぎ" if bundle["ff_futures"] else "カードは縮退表示"
+        print(f"  [ff_futures] 取得失敗（{state}）")
 
     out_dir = os.path.dirname(args.out)
     if out_dir:
