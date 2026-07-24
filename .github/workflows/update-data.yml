@@ -26,14 +26,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Save previous data for update detection and fallback
+        # 公開中の data.json を確保（初回404は許容）。通知の差分比較と、
+        # FF先物取得失敗時の前回値引き継ぎ（--prev）に使う
+        run: curl -fsS https://takuma41n.github.io/us-econ-dashboard/data.json -o prev_data.json || true
+
       - name: Fetch FRED data
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python3 fetch_data.py --out _site/data.json
-
-      - name: Save previous data for update detection
-        # デプロイ前に公開中の data.json を確保（初回404は許容）
-        run: curl -fsS https://takuma41n.github.io/us-econ-dashboard/data.json -o prev_data.json || true
+        run: python3 fetch_data.py --out _site/data.json --prev prev_data.json
 
       - name: Assemble site
         run: cp index.html _site/
