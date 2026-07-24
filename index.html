@@ -512,6 +512,8 @@ const FORECAST_SERIES = [
   { id: "VIXCLS",       months: 2 },   // VIX
   { id: "BAMLH0A0HYM2", months: 2 },   // ハイイールド債OAS
   { id: "NIKKEI225",    months: 15 },  // 日経225（125日MA・52週高値・実現ボラ用）
+  { id: "CES0500000003", months: 30 }, // 平均時給の水準（賃金モメンタム用）
+  { id: "ECIWAG",        months: 42 }, // ECI指数水準・四半期（賃金モメンタム用）
 ];
 
 /* FOMC決定日（会合2日目）。出典: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
@@ -648,7 +650,47 @@ function computeForecast(fs) {
     }
   }
 
-  return { momentum, policy, path, market, nikkei };
+  // 賃金モメンタム: 平均時給(月次)とECI(四半期)の「直近年率 − 前年比」の平均
+  // （インフレ・モメンタムと同じ2系列構成。ECI欠損時は平均時給のみ）
+  let wage = null;
+  const ahe = momOf(levels("CES0500000003"));
+  const eciL = levels("ECIWAG");
+  let eci = null;
+  if (eciL.length >= 5) {
+    eci = { annQ: (Math.pow(eciL[eciL.length - 1] / eciL[eciL.length - 2], 4) - 1) * 100,
+            yoy: (eciL[eciL.length - 1] / eciL[eciL.length - 5] - 1) * 100 };
+  }
+  if (ahe) {
+    const aheScore = ahe.ann3 - ahe.yoy;
+    const eciScore = eci ? eci.annQ - eci.yoy : null;
+    wage = { ahe, eci, aheScore, eciScore,
+             score: eciScore != null ? (aheScore + eciScore) / 2 : aheScore };
+  }
+
+  // 雇用モメンタム: 雇用者数の増勢+サームルール+失業保険申請の複合
+  // （+100=雇用堅調 ↔ −100=急悪化。実績カードの取得済みデータを再利用）
+  let labor = null;
+  const payObs = (lastPayloads.PAYEMS || {}).observations || [];  // 前月差（千人）
+  const icObs = (lastPayloads.ICSA || {}).observations || [];     // 週次（件）
+  if (payObs.length >= 12 && unObs.length >= 12 && icObs.length >= 26) {
+    const avg = a => a.reduce((x, y) => x + y, 0) / a.length;
+    const pay = payObs.map(o => o.value);
+    const un = unObs.map(o => o.value);
+    const ic = icObs.map(o => o.value);
+    const p3 = avg(pay.slice(-3)), p12 = avg(pay.slice(-12));
+    const sahm = avg(un.slice(-3)) - Math.min(...un.slice(-12));
+    const ic4 = avg(ic.slice(-4)), ic26 = avg(ic.slice(-26));
+    const icPct = (ic4 / ic26 - 1) * 100;
+    const c = {
+      payroll: clamp1((p3 - p12) / 100),   // 増勢±10万人（千人単位）でフルスケール
+      sahm: clamp1((0.25 - sahm) / 0.25),  // 0pp=+1、0.25=0、0.5pp（後退シグナル）=−1
+      claims: clamp1(-icPct / 10),         // 4週平均が26週平均±10%でフルスケール
+    };
+    labor = { score: 100 * (0.4 * c.payroll + 0.3 * c.sahm + 0.3 * c.claims),
+              c, p3, p12, sahm, ic4, ic26, icPct };
+  }
+
+  return { momentum, policy, path, market, nikkei, wage, labor };
 }
 
 /* ── FF金利先物からの織り込みパス ──
@@ -751,6 +793,8 @@ const forecastEl = document.getElementById("forecast");
 const FX_CARDS = [
   ["fx-policy",   "金融政策バイアス（タカ・ハト）", "合成スコア", true],
   ["fx-momentum", "インフレ・モメンタム",           "3ヶ月年率 − 前年比", true],
+  ["fx-labor",    "雇用モメンタム",                 "増勢+サーム+失業保険", true],
+  ["fx-wage",     "賃金モメンタム",                 "直近年率 − 前年比", true],
   ["fx-market",   "米国株センチメント（S&P500）",   "モメンタム ↔ 急落恐怖", true],
   ["fx-nikkei",   "日経225センチメント",            "モメンタム ↔ 急落恐怖", true],
   ["fx-path",     "市場が織り込む金利パス",         "国債利回り逆算", false],
@@ -835,6 +879,42 @@ function renderMomentumCard(m) {
     </div>
     <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
     <div class="card-meta">コアCPI・コアPCEの「3ヶ月年率 − 前年比」の平均</div>`);
+}
+
+function renderLaborCard(l) {
+  if (!l) return fxError("fx-labor");
+  const s = l.score;
+  const [label, cls] =
+      s < -60 ? ["急悪化（後退シグナル）", "bad"]
+    : s < -20 ? ["軟化（冷え込み）", "bad"]
+    : s <= 20 ? ["中立", ""]
+    : s <= 60 ? ["改善（雇用堅調）", "good"]
+    :           ["強い改善（過熱気味）", "good"];
+  fxCardBody("fx-labor", `
+    ${gaugeSVG(s, 100, true)}
+    <div class="card-value-row">
+      <span class="card-value">${s >= 0 ? "+" : ""}${Math.round(s)}</span>
+    </div>
+    <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-meta">雇用者数増勢 40% + サームルール 30% + 失業保険申請 30%</div>`);
+}
+
+function renderWageCard(w) {
+  if (!w) return fxError("fx-wage");
+  const s = w.score;
+  const [label, cls] =
+      s < -0.75 ? ["減速中（賃金圧力後退）", "good"]
+    : s < -0.25 ? ["やや減速", "good"]
+    : s <= 0.25 ? ["横ばい", ""]
+    : s <= 0.75 ? ["やや加速", "bad"]
+    :             ["加速中（賃金インフレ圧力）", "bad"];
+  fxCardBody("fx-wage", `
+    ${gaugeSVG(s, 2)}
+    <div class="card-value-row">
+      <span class="card-value">${pp(s)}</span><span class="card-unit">pp</span>
+    </div>
+    <div class="gauge-zone"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-meta">平均時給・ECI賃金の「直近年率 − 前年比」の${w.eciScore != null ? "平均" : "値（ECI取得不可）"}</div>`);
 }
 
 function renderSentimentCard(id, mk, meta) {
@@ -987,6 +1067,39 @@ function renderBreakdown(fx, nc, ffp) {
   }
   const mrow = (name, val, comp, w) =>
     `<tr><td>${name}</td><td>${val}</td><td>${w}%</td><td>${pp(comp * w, 0)}</td></tr>`;
+  const lb = fx.labor;
+  if (lb) {
+    html += `
+    <h3>雇用モメンタムの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>成分</th><th>値</th><th>重み</th><th>寄与</th></tr></thead>
+      <tbody>
+        ${mrow(`雇用者数の増勢（3ヶ月平均 ${(lb.p3 / 10).toFixed(1)}万人 − 12ヶ月平均 ${(lb.p12 / 10).toFixed(1)}万人）`,
+               `${pp((lb.p3 - lb.p12) / 10, 1)}万人`, lb.c.payroll, 40)}
+        ${mrow("サームルール・ギャップ（失業率3ヶ月平均 − 12ヶ月最小）",
+               `${pp(lb.sahm)}pp`, lb.c.sahm, 30)}
+        ${mrow(`失業保険申請トレンド（4週平均 ${(lb.ic4 / 1e4).toFixed(1)}万件 vs 26週平均 ${(lb.ic26 / 1e4).toFixed(1)}万件）`,
+               `${pp(lb.icPct, 1)}%`, lb.c.claims, 30)}
+        <tr><td>合成スコア</td><td></td><td></td><td><strong>${pp(lb.score, 0)}</strong></td></tr>
+      </tbody>
+    </table>`;
+  }
+  const wg = fx.wage;
+  if (wg) {
+    const wrow = (name, ann, yoy) =>
+      `<tr><td>${name}</td><td>${ann.toFixed(2)}%</td><td>${yoy.toFixed(2)}%</td><td>${pp(ann - yoy)}pp</td></tr>`;
+    html += `
+    <h3>賃金モメンタムの内訳</h3>
+    <table class="bd-table">
+      <thead><tr><th>指標</th><th>直近年率</th><th>前年比</th><th>差</th></tr></thead>
+      <tbody>
+        ${wrow("平均時給（3ヶ月年率）", wg.ahe.ann3, wg.ahe.yoy)}
+        ${wg.eci ? wrow("ECI賃金（QoQ年率・四半期）", wg.eci.annQ, wg.eci.yoy)
+                 : `<tr><td>ECI賃金</td><td colspan="3">取得不可（平均時給のみで算出）</td></tr>`}
+        <tr><td>スコア（平均）</td><td></td><td></td><td><strong>${pp(wg.score)}pp</strong></td></tr>
+      </tbody>
+    </table>`;
+  }
   const mk = fx.market;
   if (mk) {
     html += `
@@ -1047,6 +1160,11 @@ function renderBreakdown(fx, nc, ffp) {
     先物価格はCME 30日FF先物のYahoo Finance遅延データで、本家CME FedWatch
     （OIS・全会合ツリー計算）とは前提が異なるため数値がずれることがある。
     FOMC日程は2027年分まで静的登録（毎年更新が必要）。
+    雇用モメンタムは各成分を固定アンカーで±1に正規化した加重平均
+    （増勢±10万人、サームルール・ギャップ0〜0.5pp — 0.5pp到達は歴史的な景気後退シグナル —、
+    失業保険申請の4週平均は26週平均比±10%でフルスケール）。+100=雇用堅調、−100=急悪化。
+    賃金モメンタムは平均時給（月次・3ヶ月年率）とECI賃金（四半期・QoQ年率）の
+    「直近年率 − 前年比」の平均。ECI取得不可時は平均時給のみ。
     次回発表予想の出典: ${nc && nc.source ? nc.source : "Federal Reserve Bank of Cleveland, Inflation Nowcasting"}。
     株式市場センチメントは各成分を固定アンカーで±1に正規化した加重平均
     （米国: 125日線乖離±8%、下落率0〜−20%、VIX 12〜32、ハイイールドOAS 2.5〜6.5%でフルスケール。
@@ -1090,6 +1208,8 @@ async function loadForecast(bundle, force) {
   const ffp = computeFFPath(ff, fs);
   renderPolicyCard(fx.policy);
   renderMomentumCard(fx.momentum);
+  renderLaborCard(fx.labor);
+  renderWageCard(fx.wage);
   renderSentimentCard("fx-market", fx.market,
     "S&amp;P500トレンド 50% + VIX 30% + 信用スプレッド 20%");
   renderSentimentCard("fx-nikkei", fx.nikkei,
