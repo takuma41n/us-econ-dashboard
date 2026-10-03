@@ -181,6 +181,7 @@
   }
   .gauge-zone .dot.good { background: var(--good); }
   .gauge-zone .dot.bad  { background: var(--bad); }
+  .gauge-zone.left { justify-content: flex-start; }
   .card-sub { font-size: 12px; color: var(--text-secondary); }
 
   .breakdown {
@@ -211,6 +212,8 @@
   .bd-table tr > :first-child { text-align: left; width: 40%; white-space: normal; }
   .bd-table thead th { border-top: none; color: var(--text-muted); font-size: 11px; }
   .bd-note { margin-top: 12px; font-size: 11px; color: var(--text-muted); line-height: 1.7; }
+  .bd-scroll { overflow-x: auto; }
+  .bd-scroll .bd-table tr > :first-child { width: auto; white-space: nowrap; }
 
   #tooltip {
     position: fixed;
@@ -253,7 +256,7 @@
 <div id="tooltip"></div>
 
 <footer>
-  データ出典: FRED, Federal Reserve Bank of St. Louis ／ 次回発表予想は Federal Reserve Bank of Cleveland, Inflation Nowcasting ／ FF金利先物は CME 30-Day Fed Funds futures（Yahoo Finance経由・遅延データ）。実績カードをクリックするとFREDの系列ページが開きます。<br>
+  データ出典: FRED, Federal Reserve Bank of St. Louis ／ 次回発表予想は Federal Reserve Bank of Cleveland, Inflation Nowcasting ／ FF金利先物は CME 30-Day Fed Funds futures（Yahoo Finance経由・遅延データ） ／ 国債入札は U.S. Treasury, Fiscal Data。実績カードをクリックするとFREDの系列ページが開きます。<br>
   色の意味: <span style="color:var(--good)">緑</span> = インフレ沈静化・雇用改善の方向 / <span style="color:var(--bad)">赤</span> = その逆。賃金指標はインフレ圧力の観点で色付けしています。<br>
   「先読み・政策バイアス」は機械的に計算した参考値です（計算式は同セクションの「内訳と計算方法」参照）。投資助言ではありません。
 </footer>
@@ -1176,12 +1179,156 @@ function renderBreakdown(fx, nc, ffp) {
   body.innerHTML = html;
 }
 
+/* ══ 米国債入札（長期金利の需給） ═══════════════════════════
+ * 財務省 Fiscal Data の入札結果（10年債・30年債、名目、リオープン含む）。
+ * 需要の強弱は直近入札の「応札倍率」と「ディーラー落札比率（最終投資家が
+ * 付かなかった分の受け皿）」を、同じ年限の過去6回平均と比べて判定する。
+ */
+const AUCTION_CARDS = [
+  ["au-10y", "10-Year", "10年債入札"],
+  ["au-30y", "30-Year", "30年債入札"],
+];
+const AUCTION_AVG_N = 6;
+const AU_SPARK = { freq: "m", fmt: "pct", dec: 3 };  // 入札は各年限とも月1回
+
+function buildAuctionDOM() {
+  const sec = document.createElement("section");
+  sec.innerHTML = `<h2>米国債入札（長期金利の需給）</h2>`;
+  const grid = document.createElement("div");
+  grid.className = "grid";
+  for (const [id, , label] of AUCTION_CARDS) {
+    const card = document.createElement("div");
+    card.className = "card static loading";
+    card.id = id;
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="card-label">${label}</span>
+        <span class="card-sid">US TREASURY</span>
+      </div>
+      <div class="card-value-row">
+        <span class="card-value">—</span><span class="card-unit"></span>
+      </div>
+      <div class="card-meta">&nbsp;</div>`;
+    grid.appendChild(card);
+  }
+  sec.appendChild(grid);
+  const details = document.createElement("details");
+  details.className = "breakdown";
+  details.innerHTML = `<summary>入札結果の一覧と判定方法</summary><div id="au-breakdown-body"></div>`;
+  sec.appendChild(details);
+  forecastEl.appendChild(sec);
+}
+buildAuctionDOM();
+
+function computeAuction(t) {
+  const past = (t && t.past) || [];
+  if (past.length < 2) return null;
+  const last = past[past.length - 1], prev = past[past.length - 2];
+  const base = past.slice(-1 - AUCTION_AVG_N, -1);  // 直近を除く過去N回
+  const avg = k => base.reduce((a, r) => a + r[k], 0) / base.length;
+  const avgB2c = avg("bid_to_cover"), avgDealer = avg("dealer_pct");
+  const clamp1 = v => Math.max(-1, Math.min(1, v));
+  const c = {
+    b2c: clamp1((last.bid_to_cover - avgB2c) / 0.2),     // 平均比±0.2倍でフルスケール
+    dealer: clamp1((avgDealer - last.dealer_pct) / 5),  // 平均比−5pt=+1（受け皿依存が少ない）
+  };
+  const today = new Date().toISOString().slice(0, 10);
+  const next = ((t && t.upcoming) || []).find(u => u.date >= today) || null;
+  return { past, last, prev, n: base.length, avgB2c, avgDealer,
+           avgIndirect: avg("indirect_pct"), c, score: 0.5 * c.b2c + 0.5 * c.dealer, next };
+}
+
+const fmtOku = bn => `${Math.round(bn * 10).toLocaleString()}億ドル`;
+const auKind = r => (r.reopening ? "リオープン" : "新発");
+
+function renderAuctionCard(id, a, au) {
+  if (!a) return fxError(id);
+  const { last, prev } = a;
+  const [label, cls] =
+      a.score >= 0.3  ? ["需要 強め", "good"]
+    : a.score <= -0.3 ? ["需要 弱め", "bad"]
+    :                   ["需要 平均並み", ""];
+  const diff = Math.round((last.high_yield - prev.high_yield) * 1000) / 1000;
+  const delta = diff === 0
+    ? `<span class="dir">→ 変わらず</span>`
+    : `<span class="dir ${diff > 0 ? "bad" : "good"}">${diff > 0 ? "▲" : "▼"} ${Math.abs(diff).toFixed(3)}pt</span>`;
+  let nextLine = "次回 未発表";
+  if (a.next) {
+    const days = daysUntil(a.next.date);
+    nextLine = `次回 ${fmtReleaseDate(a.next.date)}（${days === 0 ? "本日" : `あと${days}日`}）`
+             + (a.next.amount_bn ? `・${fmtOku(a.next.amount_bn)}` : "");
+  }
+  fxCardBody(id, `
+    <div class="card-value-row">
+      <span class="card-value">${last.high_yield.toFixed(3)}</span><span class="card-unit">%</span>
+    </div>
+    <div class="card-meta">落札利回り ・ ${fmtReleaseDate(last.date)}入札（${auKind(last)}）${last.amount_bn ? "・" + fmtOku(last.amount_bn) : ""}</div>
+    <div class="card-delta">${delta}　前回 ${prev.high_yield.toFixed(3)}%（${fmtReleaseDate(prev.date)}）</div>
+    <svg class="spark" preserveAspectRatio="none"></svg>
+    <div class="gauge-zone left"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-sub">応札倍率 ${last.bid_to_cover.toFixed(2)}倍（過去${a.n}回平均 ${a.avgB2c.toFixed(2)}）</div>
+    <div class="card-sub">ディーラー ${last.dealer_pct.toFixed(0)}%（平均 ${a.avgDealer.toFixed(0)}%）・ 間接 ${last.indirect_pct.toFixed(0)}%</div>
+    <div class="card-release">${nextLine}${au && au.stale ? " ・ キャッシュ" : ""}</div>`);
+  drawSpark(document.querySelector(`#${id} .spark`), AU_SPARK,
+            a.past.map(r => ({ date: r.date, value: r.high_yield })).slice(-12));
+}
+
+function renderAuctionBreakdown(computed, au) {
+  const body = document.getElementById("au-breakdown-body");
+  let html = "";
+  for (const [, key, label] of AUCTION_CARDS) {
+    const a = computed[key];
+    if (!a) continue;
+    const rows = a.past.slice(-8).reverse().map(r => `
+      <tr><td>${fmtReleaseDate(r.date)}${r.reopening ? "" : " 新発"}</td>
+          <td>${r.amount_bn ? Math.round(r.amount_bn * 10).toLocaleString() : "—"}</td>
+          <td>${r.high_yield.toFixed(3)}%</td>
+          <td>${r.bid_to_cover.toFixed(2)}</td>
+          <td>${r.dealer_pct.toFixed(1)}%</td>
+          <td>${r.indirect_pct.toFixed(1)}%</td></tr>`).join("");
+    html += `
+    <h3>${label}（直近8回・新発以外はリオープン）</h3>
+    <div class="bd-scroll">
+    <table class="bd-table">
+      <thead><tr><th>入札日</th><th>発行額(億ドル)</th><th>落札利回り</th><th>応札倍率</th><th>ディーラー</th><th>間接</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    </div>`;
+  }
+  if (!html) html = `<div class="bd-note">入札データを取得できませんでした。</div>`;
+  html += `
+  <div class="bd-note">
+    落札利回り: 単一価格方式の入札で、全額が埋まった時点の最も高い利回り（全員がこの利回りで買う）。
+    発行量が増えたり買い手が慎重になると、より高い利回りを求める入札まで拾う必要があり上昇する。
+    応札倍率: 申込総額 ÷ 発行額。高いほど買い手が多い。
+    ディーラー: 最終投資家が付かなかった分を引き受けるプライマリー・ディーラーの落札比率（競争入札分に占める%）。高いほど需要が弱い。
+    間接: 海外中央銀行や運用会社などがディーラー経由で入札した分。
+    需要判定 = 応札倍率の過去${AUCTION_AVG_N}回平均との差（±0.2倍でフルスケール）50% +
+    ディーラー比率の過去${AUCTION_AVG_N}回平均との差（−5ptで強い側フルスケール）50%。
+    +0.3以上=強め、−0.3以下=弱め。
+    市場が注目する「テール」（落札利回り − 入札直前の市場利回り）は直前利回りの無料データが無いため未掲載。
+    出典: ${au && au.source ? au.source : "U.S. Treasury, Fiscal Data"}${au && au.as_of ? `（${fmtReleaseDate(au.as_of)}取得${au.stale ? "・キャッシュ" : ""}）` : ""}。
+  </div>`;
+  body.innerHTML = html;
+}
+
+function renderAuctions(au) {
+  const terms = (au && au.terms) || {};
+  const computed = {};
+  for (const [id, key] of AUCTION_CARDS) {
+    computed[key] = computeAuction(terms[key]);
+    renderAuctionCard(id, computed[key], au);
+  }
+  renderAuctionBreakdown(computed, au);
+}
+
 async function loadForecast(bundle, force) {
-  let fs, nc = null, ff = null;
+  let fs, nc = null, ff = null, au = null;
   if (bundle) {
     fs = bundle.forecast_series || {};
     nc = bundle.nowcast || null;
     ff = bundle.ff_futures || null;
+    au = bundle.auctions || null;
   } else {
     fs = {};
     await Promise.all(FORECAST_SERIES.map(async (d) => {
@@ -1203,6 +1350,10 @@ async function loadForecast(bundle, force) {
       const res = await fetch("/api/fffutures" + (force ? "?refresh=1" : ""));
       if (res.ok) ff = await res.json();
     } catch { /* カードは縮退表示 */ }
+    try {
+      const res = await fetch("/api/auctions" + (force ? "?refresh=1" : ""));
+      if (res.ok) au = await res.json();
+    } catch { /* カードは縮退表示 */ }
   }
   const fx = computeForecast(fs);
   const ffp = computeFFPath(ff, fs);
@@ -1220,6 +1371,7 @@ async function loadForecast(bundle, force) {
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
   renderBreakdown(fx, nc, ffp);
+  renderAuctions(au);
 }
 
 /* ── データ取得 ──
