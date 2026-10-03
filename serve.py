@@ -17,7 +17,7 @@ import urllib.request
 import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 
-from fetch_data import fetch_ff_futures, fetch_nowcast, fetch_usdjpy
+from fetch_data import fetch_auctions, fetch_ff_futures, fetch_nowcast, fetch_usdjpy
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -176,6 +176,8 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_usdjpy(urllib.parse.parse_qs(parsed.query))
         elif parsed.path == "/api/fffutures":
             self.handle_fffutures(urllib.parse.parse_qs(parsed.query))
+        elif parsed.path == "/api/auctions":
+            self.handle_auctions(urllib.parse.parse_qs(parsed.query))
         elif parsed.path == "/data.json":
             # ローカルでは常にライブAPIを使わせる（古い静的JSONの誤読防止）
             self.send_json(404, {"error": "not_found"})
@@ -241,6 +243,25 @@ class Handler(SimpleHTTPRequestHandler):
                 cached["stale"] = True
                 return self.send_json(200, cached)
             return self.send_json(502, {"error": "fffutures_unavailable"})
+
+    def handle_auctions(self, qs):
+        """米国債入札結果（財務省 Fiscal Data）のプロキシ。"""
+        force = (qs.get("refresh") or ["0"])[0] == "1"
+        cached = read_cache("auctions", "treasury")
+        if cached and not force and time.time() - cached["fetched_at"] < CACHE_TTL:
+            return self.send_json(200, cached)
+        try:
+            payload = fetch_auctions()
+            if payload is None:
+                raise ValueError("too few auctions")
+            payload["fetched_at"] = int(time.time())
+            write_cache("auctions", "treasury", payload)
+            return self.send_json(200, payload)
+        except Exception:
+            if cached:
+                cached["stale"] = True
+                return self.send_json(200, cached)
+            return self.send_json(502, {"error": "auctions_unavailable"})
 
     def handle_series(self, qs):
         series_id = (qs.get("id") or [""])[0].upper()

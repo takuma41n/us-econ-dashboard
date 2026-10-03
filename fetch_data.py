@@ -71,6 +71,12 @@ YAHOO_CHART_URL = ("https://query1.finance.yahoo.com/v8/finance/chart/"
                    "{symbol}?range=5d&interval=1d")
 FF_MONTH_CODES = "FGHJKMNQUVXZ"  # 限月コード: F=1月 … Z=12月
 
+# 米財務省 Fiscal Data の国債入札結果（無認証・公式）。発表済みで未実施の
+# 入札も high_yield=null で含まれるので「次回入札」にも使える。
+AUCTIONS_URL = ("https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
+                "v1/accounting/od/auctions_query")
+AUCTION_TERMS = ("10-Year", "30-Year")  # original_security_term（リオープンも同じ値）
+
 
 def load_api_key():
     key = os.environ.get("FRED_API_KEY", "").strip()
@@ -290,6 +296,79 @@ def fetch_ff_futures():
             "contracts": contracts}
 
 
+def _num(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None  # API は欠損を文字列 "null" で返す
+
+
+def fetch_auctions(days_back=400):
+    """10年債・30年債（名目、TIPS除く）の入札結果と発表済みの次回入札を返す。
+
+    返り値: {"as_of", "source", "terms": {"10-Year": {"past": [...昇順],
+             "upcoming": [...]}, "30-Year": ...}}
+    落札者の内訳（dealer/indirect/direct）は競争入札落札額に占める%。
+    いずれかの年限で実施済みが3回未満なら None（呼び出し側でフォールバック）。
+    """
+    since = (datetime.date.today() - datetime.timedelta(days=days_back)).isoformat()
+    params = urllib.parse.urlencode({
+        "filter": f"security_type:in:(Note,Bond),inflation_index_security:eq:No,"
+                  f"auction_date:gte:{since}",
+        "sort": "auction_date",
+        "page[size]": 500,
+    })
+    req = urllib.request.Request(f"{AUCTIONS_URL}?{params}",
+                                 headers={"User-Agent": "econ-dashboard/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        rows = json.loads(resp.read().decode("utf-8")).get("data", [])
+
+    terms = {t: {"past": [], "upcoming": []} for t in AUCTION_TERMS}
+    for r in rows:
+        term = r.get("original_security_term")
+        if term not in terms:
+            continue
+        amount = _num(r.get("offering_amt"))
+        base = {"date": r["auction_date"],
+                "reopening": r.get("reopening") == "Yes",
+                "amount_bn": round(amount / 1e9, 1) if amount else None}
+        high = _num(r.get("high_yield"))
+        if high is None:
+            terms[term]["upcoming"].append(base)
+            continue
+        pd_, ind, dr = (_num(r.get(k)) or 0.0 for k in (
+            "primary_dealer_accepted", "indirect_bidder_accepted", "direct_bidder_accepted"))
+        comp = pd_ + ind + dr
+        if comp <= 0:
+            continue
+        terms[term]["past"].append(dict(base,
+            high_yield=high,
+            coupon=_num(r.get("int_rate")),
+            bid_to_cover=_num(r.get("bid_to_cover_ratio")),
+            dealer_pct=round(pd_ / comp * 100, 1),
+            indirect_pct=round(ind / comp * 100, 1),
+            direct_pct=round(dr / comp * 100, 1)))
+    if any(len(v["past"]) < 3 for v in terms.values()):
+        return None
+    return {"as_of": datetime.date.today().isoformat(),
+            "source": "U.S. Treasury, Fiscal Data (Treasury Securities Auctions Data)",
+            "terms": terms}
+
+
+def _prev_section(prev_path, key):
+    """前回の data.json から key の値を stale 付きで返す。無ければ None。"""
+    if not prev_path:
+        return None
+    try:
+        with open(prev_path, encoding="utf-8") as f:
+            prev = json.load(f).get(key)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if prev:
+        prev["stale"] = True  # as_of は前回のまま → 画面で古さが分かる
+    return prev
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data.json")
@@ -363,17 +442,23 @@ def main():
         print(f"  [ff_futures] {len(bundle['ff_futures']['contracts'])} 限月, "
               f"as of {bundle['ff_futures']['as_of']}")
     else:
-        if args.prev:
-            try:
-                with open(args.prev, encoding="utf-8") as f:
-                    prev_ff = json.load(f).get("ff_futures")
-                if prev_ff:
-                    prev_ff["stale"] = True  # as_of は前回のまま → 画面で古さが分かる
-                    bundle["ff_futures"] = prev_ff
-            except (OSError, json.JSONDecodeError):
-                pass
+        bundle["ff_futures"] = _prev_section(args.prev, "ff_futures")
         state = "前回分を引き継ぎ" if bundle["ff_futures"] else "カードは縮退表示"
         print(f"  [ff_futures] 取得失敗（{state}）")
+
+    # 国債入札結果（失敗してもビルドは止めない。前回バンドルがあれば引き継ぐ）
+    try:
+        bundle["auctions"] = fetch_auctions()
+    except Exception:
+        bundle["auctions"] = None
+    if bundle["auctions"]:
+        print("  [auctions] " + ", ".join(
+            f"{t}: {len(v['past'])}回 / 予定{len(v['upcoming'])}"
+            for t, v in bundle["auctions"]["terms"].items()))
+    else:
+        bundle["auctions"] = _prev_section(args.prev, "auctions")
+        state = "前回分を引き継ぎ" if bundle["auctions"] else "カードは縮退表示"
+        print(f"  [auctions] 取得失敗（{state}）")
 
     out_dir = os.path.dirname(args.out)
     if out_dir:
