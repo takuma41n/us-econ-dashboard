@@ -43,6 +43,8 @@ ALLOWED_SERIES = {
     "NROU",            # 自然失業率（CBO）
     "DGS1",            # 1年債利回り
     "DGS2",            # 2年債利回り
+    "DGS10",           # 10年債利回り
+    "DFII10",          # 10年実質金利（TIPS）
     "EXPINF1YR",       # 1年期待インフレ
     "SP500",           # S&P500
     "VIXCLS",          # VIX

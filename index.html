@@ -183,6 +183,7 @@
   .gauge-zone .dot.bad  { background: var(--bad); }
   .gauge-zone.left { justify-content: flex-start; }
   .card-sub { font-size: 12px; color: var(--text-secondary); }
+  .nw { white-space: nowrap; }
 
   .breakdown {
     margin-top: 12px;
@@ -511,6 +512,8 @@ const FORECAST_SERIES = [
   { id: "NROU",      months: 18 },  // 自然失業率（CBO）
   { id: "DGS1",      months: 3 },   // 1年債利回り
   { id: "DGS2",      months: 3 },   // 2年債利回り
+  { id: "DGS10",     months: 3 },   // 10年債利回り（実質金利カードの名目分解用）
+  { id: "DFII10",    months: 13 },  // 10年実質金利（TIPS。専用カードに1年推移）
   { id: "EXPINF1YR", months: 6 },   // 1年期待インフレ
   { id: "SP500",        months: 15 },  // S&P500（125日MA・52週高値用）
   { id: "VIXCLS",       months: 2 },   // VIX
@@ -1196,23 +1199,32 @@ const AU_SPARK = { freq: "m", fmt: "pct", dec: 3 };  // 入札は各年限とも
  * 社債が国債に上乗せする金利。水準は過去の危機（2020年3月 8.8%、2008年12月 約22%）、
  * 拡大ペースは約1ヶ月前（暦30日前以前の最後の観測）との差で判定する。 */
 const HY_CARD = "bd-hy", HY_SID = "BAMLH0A0HYM2";
-const HY_SPARK = { freq: "d", fmt: "pct", dec: 2 };
+const DAILY_SPARK = { freq: "d", fmt: "pct", dec: 2 };  // 日次系列カード共通
+
+/* 10年実質金利（物価連動国債TIPSの利回り）: 名目10年債利回りから期待インフレを
+ * 除いた「本当の」金利。利息を生まない金や、将来利益を割り引いて評価される株に逆風。 */
+const RY_CARD = "bd-real", RY_SID = "DFII10";
+
+/* FRED系列のカード（クリックでFREDの系列ページを開く） */
+const FRED_BOND_CARDS = [[RY_CARD, "10年実質金利", RY_SID],
+                         [HY_CARD, "ハイイールド債スプレッド", HY_SID]];
 
 function buildAuctionDOM() {
   const sec = document.createElement("section");
-  sec.innerHTML = `<h2>債券市場（国債入札・信用スプレッド）</h2>`;
+  sec.innerHTML = `<h2>債券市場（実質金利・信用スプレッド・国債入札）</h2>`;
   const grid = document.createElement("div");
   grid.className = "grid";
-  const cardsDef = [[HY_CARD, "ハイイールド債スプレッド", HY_SID],
+  const cardsDef = [...FRED_BOND_CARDS,
                     ...AUCTION_CARDS.map(([id, , label]) => [id, label, "US TREASURY"])];
   for (const [id, label, sid] of cardsDef) {
+    const fredSid = (FRED_BOND_CARDS.find(c => c[0] === id) || [])[2];
     const card = document.createElement("div");
-    card.className = "card loading" + (id === HY_CARD ? "" : " static");
+    card.className = "card loading" + (fredSid ? "" : " static");
     card.id = id;
-    if (id === HY_CARD) {
+    if (fredSid) {
       card.addEventListener("click", (e) => {
         if (e.target.closest("svg")) return; // スパークライン操作中の誤クリック防止
-        window.open("https://fred.stlouisfed.org/series/" + HY_SID, "_blank");
+        window.open("https://fred.stlouisfed.org/series/" + fredSid, "_blank");
       });
     }
     card.innerHTML = `
@@ -1229,7 +1241,7 @@ function buildAuctionDOM() {
   sec.appendChild(grid);
   const details = document.createElement("details");
   details.className = "breakdown";
-  details.innerHTML = `<summary>入札結果の一覧と判定方法（信用スプレッド含む）</summary><div id="au-breakdown-body"></div>`;
+  details.innerHTML = `<summary>入札結果の一覧と判定方法（実質金利・信用スプレッド含む）</summary><div id="au-breakdown-body"></div>`;
   sec.appendChild(details);
   forecastEl.appendChild(sec);
 }
@@ -1329,12 +1341,20 @@ function renderAuctionBreakdown(computed, au) {
     企業の資金繰り不安が高まると拡大し、株の急落に先行・同時進行しやすい。
     判定: 7%以上=危機水準、5%以上=信用ストレス、それ未満では約1ヶ月前との差が+1.0pt以上=急拡大・+0.5pt以上=拡大中、3.5%未満=低水準、それ以外=平常。
     水準の参考: 2020年3月のコロナ急落時 8.8%、2008年12月の金融危機時 約22%。
+  </div>
+  <div class="bd-note">
+    10年実質金利: 物価連動国債（TIPS）10年物の利回り（FRED DFII10、約1営業日遅れ）。名目10年債利回りから期待インフレ率を除いた「物価上昇を差し引いた本当の金利」で、
+    名目10年 − 実質 = 期待インフレ率（ブレークイーブン・インフレ率）として分解表示する。
+    実質金利が上がると、利息を生まない金や、将来の利益を割り引いて評価される株（特にグロース株）に逆風になる。
+    判定: 2.5%以上=強い引き締め、2.0%以上=引き締め的、1.0%以上=中立圏、0%以上=緩和的、マイナス=超緩和。
+    水準の参考: 2008年11月 3.15%（金融危機時）、2023年10月 2.52%、2021年8月 −1.19%（過去最低）。
   </div>`;
   body.innerHTML = html;
 }
 
-function computeHY(fs) {
-  const obs = ((fs[HY_SID] || {}).observations) || [];
+/* 日次系列の直近値・約1ヶ月前（暦30日前以前の最後の観測）との差・1年レンジ */
+function dailyStats(entry) {
+  const obs = (entry && entry.observations) || [];
   if (obs.length < 30) return null;
   const last = obs[obs.length - 1];
   const cut = new Date(last.date);
@@ -1343,7 +1363,43 @@ function computeHY(fs) {
   const mAgo = [...obs].reverse().find(o => o.date <= cutISO) || obs[0];
   const yr = obs.slice(-FREQ_CONF.d[1]).map(o => o.value);
   return { obs, last, mAgo, chg1m: last.value - mAgo.value,
-           lo: Math.min(...yr), hi: Math.max(...yr), stale: !!fs[HY_SID].stale };
+           lo: Math.min(...yr), hi: Math.max(...yr), stale: !!entry.stale };
+}
+
+function chg1mDelta(ch) {
+  return ch === 0
+    ? `<span class="dir">→ 変わらず</span>`
+    : `<span class="dir ${ch > 0 ? "bad" : "good"}">${ch > 0 ? "▲" : "▼"} ${Math.abs(ch).toFixed(2)}pt</span>`;
+}
+
+function renderRealYieldCard(r, nominalEntry) {
+  if (!r) return fxError(RY_CARD);
+  const v = r.last.value, ch = Math.round(r.chg1m * 100) / 100;
+  const [label, cls] =
+      v >= 2.5 ? ["強い引き締め", "bad"]
+    : v >= 2.0 ? ["引き締め的", "bad"]
+    : v >= 1.0 ? ["中立圏", ""]
+    : v >= 0   ? ["緩和的", ""]
+    :            ["マイナス（超緩和）", ""];
+  // 名目 = 実質 + 期待インフレ（同じ日の名目10年債利回りで分解）
+  const nObs = (nominalEntry && nominalEntry.observations) || [];
+  const n = nObs.find(o => o.date === r.last.date);
+  const split = n
+    ? `<span class="nw">名目 ${n.value.toFixed(2)}%</span> = <span class="nw">実質 ${v.toFixed(2)}%</span>`
+      + ` + <span class="nw">期待インフレ ${(n.value - v).toFixed(2)}%</span>`
+    : "";
+  fxCardBody(RY_CARD, `
+    <div class="card-value-row">
+      <span class="card-value">${v.toFixed(2)}</span><span class="card-unit">%</span>
+    </div>
+    <div class="card-meta">${fmtReleaseDate(r.last.date)}時点 ・ 物価連動国債（TIPS）の利回り${r.stale ? `<span class="chip">キャッシュ</span>` : ""}</div>
+    <div class="card-delta">${chg1mDelta(ch)}　1ヶ月前 ${r.mAgo.value.toFixed(2)}%（${fmtReleaseDate(r.mAgo.date)}）</div>
+    <svg class="spark" preserveAspectRatio="none"></svg>
+    <div class="gauge-zone left"><span class="dot ${cls}"></span>${label}</div>
+    ${split ? `<div class="card-sub">${split}</div>` : ""}
+    <div class="card-sub">1年レンジ ${r.lo.toFixed(2)}〜${r.hi.toFixed(2)}%</div>
+    <div class="card-release">参考: <span class="nw">2008年11月 3.15%</span> ・ <span class="nw">2023年10月 2.52%</span> ・ <span class="nw">2021年8月 −1.19%</span></div>`);
+  drawSpark(document.querySelector(`#${RY_CARD} .spark`), DAILY_SPARK, r.obs);
 }
 
 function renderHYCard(h) {
@@ -1356,9 +1412,7 @@ function renderHYCard(h) {
     : ch >= 0.5  ? ["拡大中（警戒）", "bad"]
     : v < 3.5    ? ["低水準（楽観）", "good"]
     :              ["平常", ""];
-  const delta = ch === 0
-    ? `<span class="dir">→ 変わらず</span>`
-    : `<span class="dir ${ch > 0 ? "bad" : "good"}">${ch > 0 ? "▲" : "▼"} ${Math.abs(ch).toFixed(2)}pt</span>`;
+  const delta = chg1mDelta(ch);
   fxCardBody(HY_CARD, `
     <div class="card-value-row">
       <span class="card-value">${v.toFixed(2)}</span><span class="card-unit">%</span>
@@ -1369,7 +1423,7 @@ function renderHYCard(h) {
     <div class="gauge-zone left"><span class="dot ${cls}"></span>${label}</div>
     <div class="card-sub">1年レンジ ${h.lo.toFixed(2)}〜${h.hi.toFixed(2)}%</div>
     <div class="card-release">参考: 2020年3月 8.8% ・ 2008年12月 約22%</div>`);
-  drawSpark(document.querySelector(`#${HY_CARD} .spark`), HY_SPARK, h.obs);
+  drawSpark(document.querySelector(`#${HY_CARD} .spark`), DAILY_SPARK, h.obs);
 }
 
 function renderAuctions(au) {
@@ -1431,7 +1485,8 @@ async function loadForecast(bundle, force) {
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
   renderBreakdown(fx, nc, ffp);
-  renderHYCard(computeHY(fs));
+  renderRealYieldCard(dailyStats(fs[RY_SID]), fs.DGS10);
+  renderHYCard(dailyStats(fs[HY_SID]));
   renderAuctions(au);
 }
 
