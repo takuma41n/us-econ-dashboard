@@ -294,7 +294,7 @@ const SERIES = [
 
 const CATEGORIES = ["インフレ動向", "雇用状況", "賃金インフレ"];
 /* freq → [取得開始の遡り月数, スパークラインに描く点数] */
-const FREQ_CONF = { m: [30, 24], w: [14, 52], q: [42, 12] };
+const FREQ_CONF = { m: [30, 24], w: [14, 52], q: [42, 12], d: [13, 260] };
 
 /* ── フォーマッタ ──
  * 差分は表示と同じ丸め精度で計算する（元データの端数で
@@ -320,6 +320,7 @@ function fmtDate(s, iso) {
   const [y, m, d] = iso.split("-").map(Number);
   if (s.freq === "q") return `${y}年Q${Math.floor((m - 1) / 3) + 1}`;
   if (s.freq === "w") return `${m}/${d}週`;
+  if (s.freq === "d") return `${y}/${m}/${d}`;
   return `${y}年${m}月`;
 }
 function fmtReleaseDate(iso) {
@@ -513,7 +514,7 @@ const FORECAST_SERIES = [
   { id: "EXPINF1YR", months: 6 },   // 1年期待インフレ
   { id: "SP500",        months: 15 },  // S&P500（125日MA・52週高値用）
   { id: "VIXCLS",       months: 2 },   // VIX
-  { id: "BAMLH0A0HYM2", months: 2 },   // ハイイールド債OAS
+  { id: "BAMLH0A0HYM2", months: 13 },  // ハイイールド債OAS（専用カードに1年推移）
   { id: "NIKKEI225",    months: 15 },  // 日経225（125日MA・52週高値・実現ボラ用）
   { id: "CES0500000003", months: 30 }, // 平均時給の水準（賃金モメンタム用）
   { id: "ECIWAG",        months: 42 }, // ECI指数水準・四半期（賃金モメンタム用）
@@ -1191,19 +1192,33 @@ const AUCTION_CARDS = [
 const AUCTION_AVG_N = 6;
 const AU_SPARK = { freq: "m", fmt: "pct", dec: 3 };  // 入札は各年限とも月1回
 
+/* ハイイールド債スプレッド（ICE BofA US High Yield OAS）: 信用力の低い企業の
+ * 社債が国債に上乗せする金利。水準は過去の危機（2020年3月 8.8%、2008年12月 約22%）、
+ * 拡大ペースは約1ヶ月前（暦30日前以前の最後の観測）との差で判定する。 */
+const HY_CARD = "bd-hy", HY_SID = "BAMLH0A0HYM2";
+const HY_SPARK = { freq: "d", fmt: "pct", dec: 2 };
+
 function buildAuctionDOM() {
   const sec = document.createElement("section");
-  sec.innerHTML = `<h2>米国債入札（長期金利の需給）</h2>`;
+  sec.innerHTML = `<h2>債券市場（国債入札・信用スプレッド）</h2>`;
   const grid = document.createElement("div");
   grid.className = "grid";
-  for (const [id, , label] of AUCTION_CARDS) {
+  const cardsDef = [[HY_CARD, "ハイイールド債スプレッド", HY_SID],
+                    ...AUCTION_CARDS.map(([id, , label]) => [id, label, "US TREASURY"])];
+  for (const [id, label, sid] of cardsDef) {
     const card = document.createElement("div");
-    card.className = "card static loading";
+    card.className = "card loading" + (id === HY_CARD ? "" : " static");
     card.id = id;
+    if (id === HY_CARD) {
+      card.addEventListener("click", (e) => {
+        if (e.target.closest("svg")) return; // スパークライン操作中の誤クリック防止
+        window.open("https://fred.stlouisfed.org/series/" + HY_SID, "_blank");
+      });
+    }
     card.innerHTML = `
       <div class="card-head">
         <span class="card-label">${label}</span>
-        <span class="card-sid">US TREASURY</span>
+        <span class="card-sid">${sid}</span>
       </div>
       <div class="card-value-row">
         <span class="card-value">—</span><span class="card-unit"></span>
@@ -1214,7 +1229,7 @@ function buildAuctionDOM() {
   sec.appendChild(grid);
   const details = document.createElement("details");
   details.className = "breakdown";
-  details.innerHTML = `<summary>入札結果の一覧と判定方法</summary><div id="au-breakdown-body"></div>`;
+  details.innerHTML = `<summary>入札結果の一覧と判定方法（信用スプレッド含む）</summary><div id="au-breakdown-body"></div>`;
   sec.appendChild(details);
   forecastEl.appendChild(sec);
 }
@@ -1308,8 +1323,53 @@ function renderAuctionBreakdown(computed, au) {
     +0.3以上=強め、−0.3以下=弱め。
     市場が注目する「テール」（落札利回り − 入札直前の市場利回り）は直前利回りの無料データが無いため未掲載。
     出典: ${au && au.source ? au.source : "U.S. Treasury, Fiscal Data"}${au && au.as_of ? `（${fmtReleaseDate(au.as_of)}取得${au.stale ? "・キャッシュ" : ""}）` : ""}。
+  </div>
+  <div class="bd-note">
+    ハイイールド債スプレッド: 信用力の低い企業の社債（ハイイールド債）の利回りが同年限の米国債をどれだけ上回るか（ICE BofA US High Yield Index のOAS、FRED経由・約1営業日遅れ）。
+    企業の資金繰り不安が高まると拡大し、株の急落に先行・同時進行しやすい。
+    判定: 7%以上=危機水準、5%以上=信用ストレス、それ未満では約1ヶ月前との差が+1.0pt以上=急拡大・+0.5pt以上=拡大中、3.5%未満=低水準、それ以外=平常。
+    水準の参考: 2020年3月のコロナ急落時 8.8%、2008年12月の金融危機時 約22%。
   </div>`;
   body.innerHTML = html;
+}
+
+function computeHY(fs) {
+  const obs = ((fs[HY_SID] || {}).observations) || [];
+  if (obs.length < 30) return null;
+  const last = obs[obs.length - 1];
+  const cut = new Date(last.date);
+  cut.setDate(cut.getDate() - 30);
+  const cutISO = cut.toISOString().slice(0, 10);
+  const mAgo = [...obs].reverse().find(o => o.date <= cutISO) || obs[0];
+  const yr = obs.slice(-FREQ_CONF.d[1]).map(o => o.value);
+  return { obs, last, mAgo, chg1m: last.value - mAgo.value,
+           lo: Math.min(...yr), hi: Math.max(...yr), stale: !!fs[HY_SID].stale };
+}
+
+function renderHYCard(h) {
+  if (!h) return fxError(HY_CARD);
+  const v = h.last.value, ch = Math.round(h.chg1m * 100) / 100;
+  const [label, cls] =
+      v >= 7     ? ["危機水準（2008年・2020年級）", "bad"]
+    : v >= 5     ? ["信用ストレス", "bad"]
+    : ch >= 1.0  ? ["急拡大（要警戒）", "bad"]
+    : ch >= 0.5  ? ["拡大中（警戒）", "bad"]
+    : v < 3.5    ? ["低水準（楽観）", "good"]
+    :              ["平常", ""];
+  const delta = ch === 0
+    ? `<span class="dir">→ 変わらず</span>`
+    : `<span class="dir ${ch > 0 ? "bad" : "good"}">${ch > 0 ? "▲" : "▼"} ${Math.abs(ch).toFixed(2)}pt</span>`;
+  fxCardBody(HY_CARD, `
+    <div class="card-value-row">
+      <span class="card-value">${v.toFixed(2)}</span><span class="card-unit">%</span>
+    </div>
+    <div class="card-meta">${fmtReleaseDate(h.last.date)}時点 ・ 米国債に対する上乗せ金利（OAS）${h.stale ? `<span class="chip">キャッシュ</span>` : ""}</div>
+    <div class="card-delta">${delta}　1ヶ月前 ${h.mAgo.value.toFixed(2)}%（${fmtReleaseDate(h.mAgo.date)}）</div>
+    <svg class="spark" preserveAspectRatio="none"></svg>
+    <div class="gauge-zone left"><span class="dot ${cls}"></span>${label}</div>
+    <div class="card-sub">1年レンジ ${h.lo.toFixed(2)}〜${h.hi.toFixed(2)}%</div>
+    <div class="card-release">参考: 2020年3月 8.8% ・ 2008年12月 約22%</div>`);
+  drawSpark(document.querySelector(`#${HY_CARD} .spark`), HY_SPARK, h.obs);
 }
 
 function renderAuctions(au) {
@@ -1371,6 +1431,7 @@ async function loadForecast(bundle, force) {
   renderNowcastCard("fx-nc-cpi", nc, "cpi_core", "cpi", "CPI", fx.momentum, "CPILFESL");
   renderNowcastCard("fx-nc-pce", nc, "pce_core", "pce", "PCE", fx.momentum, "PCEPILFE");
   renderBreakdown(fx, nc, ffp);
+  renderHYCard(computeHY(fs));
   renderAuctions(au);
 }
 
